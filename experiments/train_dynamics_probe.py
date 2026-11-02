@@ -5,18 +5,23 @@ perfect state (robot pose + ball positions) instead of learned latents. This
 isolates predictor capacity from encoder quality.
 
 State (11): robot (x, y, theta) + cue/red/blue/yellow (x, y).
+Velocity (11, default on): previous-step state delta s_t - s_{t-1}.
 Action (4): left_pwm, right_pwm, fire, fire_force.
 
+Training unrolls the model on its own predictions for --rollout-steps steps
+(1 = ordinary one-step training) and averages the loss over the unroll.
+
 Primary metric: position error on balls that are actually moving, against a
-"nothing moves" baseline. Training oversamples transitions where a ball moved
-more than 5 mm so they make up ~50% of each epoch.
+"nothing moves" baseline, for one-step and multi-step rollouts.
 
 Usage:
-    python experiments/train_dynamics_probe.py                  # positions only (11-d state)
-    python experiments/train_dynamics_probe.py --with-velocity  # also feed s_t - s_{t-1}
+    python experiments/train_dynamics_probe.py                     # velocity, one-step training
+    python experiments/train_dynamics_probe.py --rollout-steps 10  # 10-step unrolled training
+    python experiments/train_dynamics_probe.py --positions-only    # 11-d state, no velocity
 """
 import argparse
 import glob
+import json
 import os
 import sys
 import time
@@ -42,14 +47,15 @@ HOLDOUT_FRACTION = 0.02
 EARLY_STOP_PATIENCE = 5
 EARLY_STOP_MIN_DELTA = 1e-6
 HORIZONS = [1, 3, 5, 10]
+DEFAULT_ROLLOUT_STEPS = 1  # multi-step unrolls (3, 10) tested worse or equal; see commit message
 SEED = 0
 STATE_DIM = 11
 ACTION_DIM = 4
 THETA = 2  # index of robot heading in the state vector
 BALL_NAMES = ["cue", "red", "blue", "yellow"]
 MOVE_THRESHOLD = 1e-3        # m; a ball counts as "moving" for evaluation above this
-OVERSAMPLE_THRESHOLD = 5e-3  # m; transitions with any ball moving more than this get oversampled
-OVERSAMPLE_FRACTION = 0.5    # target share of those transitions in each epoch
+OVERSAMPLE_THRESHOLD = 5e-3  # m; windows starting with a ball moving more than this get oversampled
+OVERSAMPLE_FRACTION = 0.5    # target share of those windows in each epoch
 
 
 def wrap_angle(a):
@@ -121,6 +127,11 @@ def ball_displacement(s_a, s_b):
     return np.linalg.norm((s_b[:, 3:] - s_a[:, 3:]).reshape(-1, 4, 2), axis=-1)
 
 
+def episode_lengths(ep_idx):
+    _, inv, counts = np.unique(ep_idx, return_inverse=True, return_counts=True)
+    return counts[inv]
+
+
 def report_data_stats(s0, s1, actions, source):
     disp = ball_displacement(s0, s1)
     fire = actions[:, 2] > 0.5
@@ -163,8 +174,29 @@ class Model:
         x = (torch.cat(parts, -1) - self.x_mean) / self.x_std
         d = self.net(x) * self.d_std + self.d_mean
         s_next = s + d
-        s_next[..., THETA] = wrap_angle_t(s_next[..., THETA])
+        s_next = torch.cat([s_next[..., :THETA], wrap_angle_t(s_next[..., THETA:THETA + 1]),
+                            s_next[..., THETA + 1:]], -1)
         return s_next
+
+
+def unroll_loss(model, S0, S1, A, V, starts, K):
+    """Unroll K steps from `starts` on the model's own predictions; mean normalized state error.
+
+    Errors are divided by the per-dimension std of one-step deltas so robot and ball
+    dimensions contribute on a comparable scale.
+    """
+    s = S0[starts]
+    vel = V[starts] if V is not None else None
+    total = 0.0
+    for k in range(K):
+        rows = starts + k
+        s_next = model.step(s, vel, A[rows])
+        err = state_delta(s_next, S1[rows]) / model.d_std
+        total = total + (err ** 2).mean()
+        if vel is not None:
+            vel = state_delta(s_next, s)
+        s = s_next
+    return total / K
 
 
 def errors(pred, true):
@@ -175,13 +207,19 @@ def errors(pred, true):
     return robot_pos, heading, balls
 
 
+def run_name(args):
+    return f"{'pos' if args.positions_only else 'vel'}_k{args.rollout_steps}"
+
+
 def train(args):
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
+    use_vel = not args.positions_only
+    K = args.rollout_steps
 
     s0, s1, actions, ep_idx, step_idx, source = load_data()
     report_data_stats(s0, s1, actions, source)
-    vel = prev_delta(s0, step_idx) if args.with_velocity else None
+    vel = prev_delta(s0, step_idx) if use_vel else None
 
     # Split by episode so holdout rollouts never see training trajectories.
     episodes = np.unique(ep_idx)
@@ -192,54 +230,59 @@ def train(args):
 
     inputs = np.concatenate([s0] + ([vel] if vel is not None else []) + [actions], 1)
     deltas = state_delta(s1, s0)
-
     x_mean, x_std = inputs[tr].mean(0), inputs[tr].std(0) + 1e-6
     d_mean, d_std = deltas[tr].mean(0), deltas[tr].std(0) + 1e-6
     T = lambda a: torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))
-    x_mean_t, x_std_t, d_mean_t, d_std_t = map(T, (x_mean, x_std, d_mean, d_std))
 
-    X_tr, Y_tr = T((inputs[tr] - x_mean) / x_std), T((deltas[tr] - d_mean) / d_std)
-    X_ho, Y_ho = T((inputs[ho] - x_mean) / x_std), T((deltas[ho] - d_mean) / d_std)
+    S0, S1, A = T(s0), T(s1), T(actions)
+    V = T(vel) if vel is not None else None
 
-    # Oversample transitions with real ball motion so they're ~OVERSAMPLE_FRACTION of each epoch.
-    moving_tr = (ball_displacement(s0[tr], s1[tr]) > OVERSAMPLE_THRESHOLD).any(1)
-    frac = moving_tr.mean()
+    # Training windows: K consecutive steps inside one episode.
+    ep_len = episode_lengths(ep_idx)
+    valid = step_idx + K <= ep_len
+    tr_starts = np.where(tr & valid)[0]
+    ho_starts = torch.from_numpy(np.where(ho & valid)[0])
+
+    # Oversample windows that start with real ball motion, up to OVERSAMPLE_FRACTION.
+    moving = (ball_displacement(s0[tr_starts], s1[tr_starts]) > OVERSAMPLE_THRESHOLD).any(1)
+    frac = moving.mean()
     if 0 < frac < OVERSAMPLE_FRACTION:
-        w = np.where(moving_tr, OVERSAMPLE_FRACTION / frac, (1 - OVERSAMPLE_FRACTION) / (1 - frac))
+        w = np.where(moving, OVERSAMPLE_FRACTION / frac, (1 - OVERSAMPLE_FRACTION) / (1 - frac))
     else:
-        w = np.ones(len(moving_tr))
+        w = np.ones(len(moving))
     sample_w = torch.from_numpy(w)
-    print(f"Mode: {'positions + velocity' if args.with_velocity else 'positions only'} "
-          f"(input dim {inputs.shape[1]})")
-    print(f"Train transitions with a ball moving >5mm: {100 * frac:.1f}% "
-          f"-> sampled at ~{100 * max(frac, OVERSAMPLE_FRACTION):.0f}% per epoch")
+    tr_starts = torch.from_numpy(tr_starts)
 
     net = DynamicsMLP(inputs.shape[1], STATE_DIM, HIDDEN)
+    model = Model(net, T(x_mean), T(x_std), T(d_mean), T(d_std))
     opt = torch.optim.Adam(net.parameters(), lr=LR)
+    print(f"Run: {run_name(args)}  |  input: {'positions + velocity' if use_vel else 'positions only'} "
+          f"(dim {inputs.shape[1]})  |  training unroll: {K} step(s)")
+    print(f"Train windows starting with a ball moving >5mm: {100 * frac:.1f}% "
+          f"-> sampled at ~{100 * max(frac, OVERSAMPLE_FRACTION):.0f}% per epoch")
     print(f"Params: {sum(p.numel() for p in net.parameters()):,}")
-    print(f"Train: {tr.sum()} transitions, Holdout: {ho.sum()} ({n_hold_ep} episodes)\n")
+    print(f"Train windows: {len(tr_starts)}, Holdout windows: {len(ho_starts)} ({n_hold_ep} episodes)\n")
 
     best, best_state, patience = float("inf"), None, 0
-    n_tr = len(X_tr)
+    n_tr = len(tr_starts)
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
         net.train()
-        idx = torch.multinomial(sample_w, n_tr, replacement=True)
-        total, n_seen = 0.0, 0
+        idx = tr_starts[torch.multinomial(sample_w, n_tr, replacement=True)]
+        total, n_batches = 0.0, 0
         for i in range(0, n_tr - BATCH_SIZE + 1, BATCH_SIZE):
-            b = idx[i:i + BATCH_SIZE]
-            loss = nn.functional.mse_loss(net(X_tr[b]), Y_tr[b])
+            loss = unroll_loss(model, S0, S1, A, V, idx[i:i + BATCH_SIZE], K)
             opt.zero_grad()
             loss.backward()
             opt.step()
-            total += loss.item() * len(b)
-            n_seen += len(b)
+            total += loss.item()
+            n_batches += 1
 
         net.eval()
         with torch.no_grad():
-            hold_loss = nn.functional.mse_loss(net(X_ho), Y_ho).item()
-        print(f"Epoch {epoch:3d}/{EPOCHS}  train={total / n_seen:.5f}  holdout={hold_loss:.5f}  "
-              f"({time.time() - t0:.1f}s)")
+            hold_loss = unroll_loss(model, S0, S1, A, V, ho_starts, K).item()
+        print(f"Epoch {epoch:3d}/{EPOCHS}  train={total / n_batches:.5f}  holdout={hold_loss:.5f}  "
+              f"({time.time() - t0:.1f}s)", flush=True)
 
         if hold_loss < best - EARLY_STOP_MIN_DELTA:
             best, patience = hold_loss, 0
@@ -252,22 +295,21 @@ def train(args):
 
     net.load_state_dict(best_state)
     net.eval()
-    model = Model(net, x_mean_t, x_std_t, d_mean_t, d_std_t)
 
     # --- One-step holdout error in physical units ---
     with torch.no_grad():
-        S0, S1, A = T(s0[ho]), T(s1[ho]), T(actions[ho])
-        V = T(vel[ho]) if vel is not None else None
-        rp, hd, bl = errors(model.step(S0, V, A), S1)
-        rp0, hd0, bl0 = errors(S0, S1)  # baseline: predict no change
-    moving = torch.from_numpy(ball_displacement(s0[ho], s1[ho]) > MOVE_THRESHOLD)
+        S0h, S1h, Ah = T(s0[ho]), T(s1[ho]), T(actions[ho])
+        Vh = T(vel[ho]) if vel is not None else None
+        rp, hd, bl = errors(model.step(S0h, Vh, Ah), S1h)
+        rp0, hd0, bl0 = errors(S0h, S1h)  # baseline: predict no change
+    mov = torch.from_numpy(ball_displacement(s0[ho], s1[ho]) > MOVE_THRESHOLD)
 
     print("\n" + "=" * 64)
     print("PRIMARY: one-step error on MOVING balls (moved >1mm this step)")
-    if moving.any():
-        m, b = 1000 * bl[moving].mean().item(), 1000 * bl0[moving].mean().item()
+    if mov.any():
+        m, b = 1000 * bl[mov].mean().item(), 1000 * bl0[mov].mean().item()
         print(f"  model {m:.3f} mm  vs  baseline {b:.3f} mm   "
-              f"-> {b / m:.2f}x better (n={int(moving.sum())} ball-steps)")
+              f"-> {b / m:.2f}x better (n={int(mov.sum())} ball-steps)")
     else:
         print("  no moving balls in holdout")
     print("=" * 64)
@@ -276,20 +318,22 @@ def train(args):
     print(f"  Robot heading : {hd.mean():.3f} deg  (baseline {hd0.mean():.3f} deg)")
     print(f"  Ball position : {1000 * bl.mean():.4f} mm  (baseline {1000 * bl0.mean():.4f} mm)")
     for i, name in enumerate(BALL_NAMES):
-        mi = moving[:, i]
+        mi = mov[:, i]
         mv = (f" | moving: {1000 * bl[mi, i].mean():.3f} vs {1000 * bl0[mi, i].mean():.3f} mm"
               if mi.any() else "")
         print(f"    {name:6s}: {1000 * bl[:, i].mean():.4f} mm (baseline {1000 * bl0[:, i].mean():.4f}){mv}")
 
-    rollout = rollout_eval(model, s0, s1, actions, ep_idx, step_idx, ho, vel is not None, T)
-    plot_rollout(rollout, args.with_velocity)
+    rollout = rollout_eval(model, s0, s1, actions, ep_idx, step_idx, ho, use_vel, T)
+    plot_rollout(rollout, args)
+
+    os.makedirs(FIGURES_DIR, exist_ok=True)
+    with open(os.path.join(FIGURES_DIR, f"dynamics_rollout_{run_name(args)}.json"), "w") as f:
+        json.dump({"horizons": HORIZONS, **rollout}, f, indent=1)
 
 
 def rollout_eval(model, s0, s1, actions, ep_idx, step_idx, ho, use_vel, T):
     H = max(HORIZONS)
-    # Episode lengths differ between datasets; a start needs H more steps in the same episode.
-    _, inv, counts = np.unique(ep_idx, return_inverse=True, return_counts=True)
-    ep_len = counts[inv]
+    ep_len = episode_lengths(ep_idx)
     hold_rows = np.where(ho)[0]
     # Rows are sorted by (episode, step), so row r+k is step t+k of the same episode.
     starts = hold_rows[step_idx[hold_rows] + H <= ep_len[hold_rows]]
@@ -305,9 +349,7 @@ def rollout_eval(model, s0, s1, actions, ep_idx, step_idx, ho, use_vel, T):
             rows = starts + h - 1
             s_next = model.step(s, vel, T(actions[rows]))
             if use_vel:
-                d = s_next - s
-                d[:, THETA] = wrap_angle_t(d[:, THETA])
-                vel = d
+                vel = state_delta(s_next, s)
             s = s_next
             if h in HORIZONS:
                 true = T(s1[rows])
@@ -338,7 +380,7 @@ def rollout_eval(model, s0, s1, actions, ep_idx, step_idx, ho, use_vel, T):
     return out
 
 
-def plot_rollout(out, with_velocity):
+def plot_rollout(out, args):
     os.makedirs(FIGURES_DIR, exist_ok=True)
     fig, axes = plt.subplots(1, 4, figsize=(17, 4), gridspec_kw={"width_ratios": [1.4, 1, 1, 1]})
     panels = [("ball_moving", "Moving-ball error (mm)  [primary]", 1000),
@@ -355,17 +397,19 @@ def plot_rollout(out, with_velocity):
         ax.set_ylim(bottom=0)
         ax.grid(alpha=0.3)
     axes[0].legend()
-    mode = "positions + velocity" if with_velocity else "positions only"
-    fig.suptitle(f"Ground-truth-state dynamics probe — error vs. horizon ({mode})")
+    mode = "positions only" if args.positions_only else "positions + velocity"
+    fig.suptitle(f"Ground-truth-state dynamics probe — {mode}, trained with "
+                 f"{args.rollout_steps}-step unroll")
     fig.tight_layout()
-    name = "dynamics_rollout_vel.png" if with_velocity else "dynamics_rollout.png"
-    path = os.path.join(FIGURES_DIR, name)
+    path = os.path.join(FIGURES_DIR, f"dynamics_rollout_{run_name(args)}.png")
     fig.savefig(path, dpi=150)
     print(f"\nSaved plot to {path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--with-velocity", action="store_true",
-                        help="Also feed the previous-step state delta (finite-difference velocity)")
+    parser.add_argument("--positions-only", action="store_true",
+                        help="Drop the previous-step velocity input (11-d state only)")
+    parser.add_argument("--rollout-steps", type=int, default=DEFAULT_ROLLOUT_STEPS,
+                        help="Unroll length used in the training loss (1 = one-step training)")
     train(parser.parse_args())
