@@ -35,3 +35,5 @@ runs/
 
 # Jupyter
 .ipynb_checkpoints/
+# Scratch renders
+test_render.png
