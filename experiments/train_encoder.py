@@ -22,6 +22,7 @@ SAVE_EVERY = 10
 EARLY_STOP_PATIENCE = 5
 EARLY_STOP_MIN_DELTA = 1e-7
 EMA_TAU = 0.005
+DATA_PATTERN = "batch_v3_*.npz"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -42,9 +43,9 @@ class TransitionDataset(Dataset):
 
 
 def load_data():
-    files = sorted(glob.glob(os.path.join(DATASETS_DIR, "batch_*.npz")))
+    files = sorted(glob.glob(os.path.join(DATASETS_DIR, DATA_PATTERN)))
     if not files:
-        raise FileNotFoundError(f"No batch files in {DATASETS_DIR}")
+        raise FileNotFoundError(f"No {DATA_PATTERN} files in {DATASETS_DIR}")
 
     all_fb, all_fa = [], []
     all_left, all_right, all_fire, all_force = [], [], [], []
@@ -84,6 +85,23 @@ def check_collapse(encoder, sample_frames, device):
     return mean_std, mean_dist
 
 
+def evaluate_holdout(encoder, target_encoder, predictor, loader, device):
+    """Mean prediction MSE on held-out transitions (no gradient)."""
+    encoder.eval()
+    predictor.eval()
+    total, count = 0.0, 0
+    with torch.no_grad():
+        for fb, fa, act in loader:
+            fb, fa, act = fb.to(device), fa.to(device), act.to(device)
+            pred = predictor(encoder(fb), act)
+            target = target_encoder(fa)
+            total += nn.functional.mse_loss(pred, target, reduction="sum").item() / pred.shape[1]
+            count += pred.shape[0]
+    encoder.train()
+    predictor.train()
+    return total / count
+
+
 def save_checkpoint(encoder, predictor, suffix=""):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     enc_path = os.path.join(CHECKPOINT_DIR, f"encoder{suffix}.pt")
@@ -109,6 +127,10 @@ def train():
         train_dataset, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=0, pin_memory=(DEVICE == "cuda"), drop_last=True,
     )
+    holdout_dataset = TransitionDataset(
+        frames_before[holdout_idx], frames_after[holdout_idx], actions[holdout_idx]
+    )
+    holdout_loader = DataLoader(holdout_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     encoder = VisualEncoder(latent_dim=64, num_simplices=8).to(DEVICE)
     target_encoder = VisualEncoder(latent_dim=64, num_simplices=8).to(DEVICE)
@@ -164,10 +186,11 @@ def train():
         avg_loss = epoch_loss / n_batches
         elapsed = time.time() - t0
 
-        latent_std, latent_dist = check_collapse(encoder, frames_before, DEVICE)
+        holdout_loss = evaluate_holdout(encoder, target_encoder, predictor, holdout_loader, DEVICE)
+        latent_std, latent_dist = check_collapse(encoder, frames_before[holdout_idx], DEVICE)
         collapsed = "COLLAPSED" if latent_dist < 0.01 else "ok"
 
-        print(f"Epoch {epoch:3d}/{EPOCHS}  loss={avg_loss:.6f}  "
+        print(f"Epoch {epoch:3d}/{EPOCHS}  loss={avg_loss:.6f}  holdout={holdout_loss:.6f}  "
               f"latent_std={latent_std:.4f}  latent_dist={latent_dist:.4f}  "
               f"[{collapsed}]  ({elapsed:.1f}s)")
 
@@ -175,15 +198,15 @@ def train():
             enc_path, _ = save_checkpoint(encoder, predictor, f"_epoch{epoch}")
             print(f"  -> Checkpoint saved: {enc_path}")
 
-        if avg_loss < best_loss - EARLY_STOP_MIN_DELTA:
-            best_loss = avg_loss
+        if holdout_loss < best_loss - EARLY_STOP_MIN_DELTA:
+            best_loss = holdout_loss
             patience_counter = 0
             save_checkpoint(encoder, predictor, "_best")
         else:
             patience_counter += 1
 
         if patience_counter >= EARLY_STOP_PATIENCE:
-            print(f"\nEarly stopping at epoch {epoch} (no improvement for {EARLY_STOP_PATIENCE} epochs)")
+            print(f"\nEarly stopping at epoch {epoch} (no holdout improvement for {EARLY_STOP_PATIENCE} epochs)")
             break
 
     enc_path, pred_path = save_checkpoint(encoder, predictor)
