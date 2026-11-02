@@ -37,7 +37,7 @@ ANGULAR_DAMPING = 0.95
 MAX_STRIKE_IMPULSE = 0.05
 
 # "behind_cue" reset: robot front placed behind the cue ball, roughly aimed at it
-SETUP_DISTANCE_RANGE = (0.03, 0.12)       # m, robot front -> cue ball center
+SETUP_DISTANCE_RANGE = (0.03, 0.07)       # m, robot front -> cue ball center
 SETUP_AIM_OFFSET_RANGE = (-math.pi / 4, math.pi / 4)  # heading offset from the aim line
 SETUP_MAX_TRIES = 1000
 
@@ -125,7 +125,7 @@ class SimEnv(BaseEnv):
         """Reset the table.
 
         setup="default":    robot at a fixed spot, cue ball at the center, targets random.
-        setup="behind_cue": cue ball at a random spot; robot front 3-12 cm behind it along a
+        setup="behind_cue": cue ball at a random spot; robot front 3-7 cm behind it along a
                             random aim line, heading within +/-45 deg of that line; targets
                             random and non-overlapping.
         """
