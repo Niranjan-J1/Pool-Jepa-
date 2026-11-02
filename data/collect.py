@@ -11,48 +11,57 @@ from env.sim_env import SimEnv
 
 NUM_EPISODES = 1000
 STEPS_PER_EPISODE = 50
-FIRE_STEP = 25
+FIRES_PER_EPISODE = (3, 5)      # inclusive range
+FIRE_STEP_RANGE = (5, 45)       # inclusive range of steps eligible to fire
 BATCH_SIZE = 100
+FILE_PREFIX = "batch_v3"
 DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
 
+FIELDS = [
+    "frames_before", "frames_after",
+    "actions_left_pwm", "actions_right_pwm", "actions_fire", "actions_fire_force",
+    "robot_pose_before", "robot_pose_after",
+    "ball_positions_before", "ball_positions_after",
+    "episode_idx", "step_idx",
+]
+DTYPES = {
+    "frames_before": np.uint8, "frames_after": np.uint8,
+    "actions_fire": np.bool_,
+    "episode_idx": np.int32, "step_idx": np.int32,
+}
 
-def save_batch(batch_idx, frames_before, frames_after, left, right, fire, force):
-    path = os.path.join(DATASETS_DIR, f"batch_{batch_idx:03d}.npz")
-    np.savez_compressed(
-        path,
-        frames_before=np.array(frames_before, dtype=np.uint8),
-        frames_after=np.array(frames_after, dtype=np.uint8),
-        actions_left_pwm=np.array(left, dtype=np.float32),
-        actions_right_pwm=np.array(right, dtype=np.float32),
-        actions_fire=np.array(fire, dtype=np.bool_),
-        actions_fire_force=np.array(force, dtype=np.float32),
-    )
+
+def save_batch(batch_idx, buf):
+    path = os.path.join(DATASETS_DIR, f"{FILE_PREFIX}_{batch_idx:03d}.npz")
+    arrays = {k: np.array(v, dtype=DTYPES.get(k, np.float32)) for k, v in buf.items()}
+    np.savez_compressed(path, **arrays)
     size_mb = os.path.getsize(path) / (1024 * 1024)
     return path, size_mb
+
+
+def sample_fire_steps():
+    n_fires = random.randint(*FIRES_PER_EPISODE)
+    return set(random.sample(range(FIRE_STEP_RANGE[0], FIRE_STEP_RANGE[1] + 1), n_fires))
 
 
 def collect():
     os.makedirs(DATASETS_DIR, exist_ok=True)
     env = SimEnv()
-
-    frames_before = []
-    frames_after = []
-    actions_left_pwm = []
-    actions_right_pwm = []
-    actions_fire = []
-    actions_fire_force = []
+    buf = {k: [] for k in FIELDS}
 
     t0 = time.time()
     batch_idx = 0
     total_saved_mb = 0.0
+    total_fires = 0
 
     for ep in range(NUM_EPISODES):
         obs = env.reset()
+        fire_steps = sample_fire_steps()
+        total_fires += len(fire_steps)
 
         for step in range(STEPS_PER_EPISODE):
-            frame_before = obs["frame"]
-
-            fire = step == FIRE_STEP
+            prev = obs
+            fire = step in fire_steps
             action = Action(
                 left_pwm=random.uniform(-1, 1),
                 right_pwm=random.uniform(-1, 1),
@@ -62,19 +71,21 @@ def collect():
 
             obs = env.step(action)
 
-            frames_before.append(frame_before)
-            frames_after.append(obs["frame"])
-            actions_left_pwm.append(action["left_pwm"])
-            actions_right_pwm.append(action["right_pwm"])
-            actions_fire.append(action["fire"])
-            actions_fire_force.append(action["fire_force"])
+            buf["frames_before"].append(prev["frame"])
+            buf["frames_after"].append(obs["frame"])
+            buf["actions_left_pwm"].append(action["left_pwm"])
+            buf["actions_right_pwm"].append(action["right_pwm"])
+            buf["actions_fire"].append(action["fire"])
+            buf["actions_fire_force"].append(action["fire_force"])
+            buf["robot_pose_before"].append(prev["robot_pose"])
+            buf["robot_pose_after"].append(obs["robot_pose"])
+            buf["ball_positions_before"].append(prev["ball_positions"])
+            buf["ball_positions_after"].append(obs["ball_positions"])
+            buf["episode_idx"].append(ep)
+            buf["step_idx"].append(step)
 
         if (ep + 1) % BATCH_SIZE == 0:
-            path, size_mb = save_batch(
-                batch_idx, frames_before, frames_after,
-                actions_left_pwm, actions_right_pwm,
-                actions_fire, actions_fire_force,
-            )
+            path, size_mb = save_batch(batch_idx, buf)
             total_saved_mb += size_mb
             batch_idx += 1
 
@@ -82,18 +93,16 @@ def collect():
             eps_per_sec = (ep + 1) / elapsed
             print(f"Episode {ep + 1}/{NUM_EPISODES}  "
                   f"({eps_per_sec:.1f} ep/s, {elapsed:.0f}s elapsed)  "
-                  f"Saved {path} ({size_mb:.1f} MB)")
+                  f"Saved {path} ({size_mb:.1f} MB)", flush=True)
 
-            frames_before.clear()
-            frames_after.clear()
-            actions_left_pwm.clear()
-            actions_right_pwm.clear()
-            actions_fire.clear()
-            actions_fire_force.clear()
+            for v in buf.values():
+                v.clear()
 
     elapsed = time.time() - t0
+    n_trans = NUM_EPISODES * STEPS_PER_EPISODE
     print(f"\nDone. {NUM_EPISODES} episodes, {batch_idx} batches, "
           f"{total_saved_mb:.1f} MB total, {elapsed:.0f}s")
+    print(f"Fire transitions: {total_fires}/{n_trans} ({100 * total_fires / n_trans:.1f}%)")
 
 
 if __name__ == "__main__":
