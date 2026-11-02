@@ -15,6 +15,7 @@ FIRES_PER_EPISODE = (3, 5)      # inclusive range
 FIRE_STEP_RANGE = (5, 45)       # inclusive range of steps eligible to fire
 BATCH_SIZE = 100
 FILE_PREFIX = "batch_v3"
+RESET_SETUP = "behind_cue"
 DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
 
 FIELDS = [
@@ -23,10 +24,11 @@ FIELDS = [
     "robot_pose_before", "robot_pose_after",
     "ball_positions_before", "ball_positions_after",
     "episode_idx", "step_idx",
+    "strike_connected", "setup_distance", "setup_aim_offset",
 ]
 DTYPES = {
     "frames_before": np.uint8, "frames_after": np.uint8,
-    "actions_fire": np.bool_,
+    "actions_fire": np.bool_, "strike_connected": np.bool_,
     "episode_idx": np.int32, "step_idx": np.int32,
 }
 
@@ -53,9 +55,11 @@ def collect():
     batch_idx = 0
     total_saved_mb = 0.0
     total_fires = 0
+    total_connected = 0
 
     for ep in range(NUM_EPISODES):
-        obs = env.reset()
+        obs = env.reset(setup=RESET_SETUP)
+        setup = env.last_setup
         fire_steps = sample_fire_steps()
         total_fires += len(fire_steps)
 
@@ -83,6 +87,10 @@ def collect():
             buf["ball_positions_after"].append(obs["ball_positions"])
             buf["episode_idx"].append(ep)
             buf["step_idx"].append(step)
+            buf["strike_connected"].append(env.last_strike_connected)
+            buf["setup_distance"].append(setup.get("distance", np.nan))
+            buf["setup_aim_offset"].append(setup.get("aim_offset", np.nan))
+            total_connected += env.last_strike_connected
 
         if (ep + 1) % BATCH_SIZE == 0:
             path, size_mb = save_batch(batch_idx, buf)
@@ -103,6 +111,8 @@ def collect():
     print(f"\nDone. {NUM_EPISODES} episodes, {batch_idx} batches, "
           f"{total_saved_mb:.1f} MB total, {elapsed:.0f}s")
     print(f"Fire transitions: {total_fires}/{n_trans} ({100 * total_fires / n_trans:.1f}%)")
+    print(f"Strikes that connected with the cue ball: {total_connected}/{total_fires} "
+          f"({100 * total_connected / max(1, total_fires):.1f}%)")
 
 
 if __name__ == "__main__":

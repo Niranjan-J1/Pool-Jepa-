@@ -36,6 +36,11 @@ ANGULAR_DAMPING = 0.95
 # Solenoid
 MAX_STRIKE_IMPULSE = 0.05
 
+# "behind_cue" reset: robot front placed behind the cue ball, roughly aimed at it
+SETUP_DISTANCE_RANGE = (0.03, 0.12)       # m, robot front -> cue ball center
+SETUP_AIM_OFFSET_RANGE = (-math.pi / 4, math.pi / 4)  # heading offset from the aim line
+SETUP_MAX_TRIES = 1000
+
 # Simulation
 DT = 1 / 60.0
 SUBSTEPS = 10
@@ -58,6 +63,8 @@ class SimEnv(BaseEnv):
         self._ball_shapes: dict[str, pymunk.Shape] = {}
         self._fig = None
         self._ax = None
+        self.last_setup: dict = {}
+        self.last_strike_connected = False
 
     def _create_space(self) -> pymunk.Space:
         space = pymunk.Space()
@@ -114,22 +121,100 @@ class SimEnv(BaseEnv):
         hw = TABLE_WIDTH / 2 - margin
         return (random.uniform(-hl, hl), random.uniform(-hw, hw))
 
-    def reset(self) -> Observation:
+    def reset(self, setup: str = "default") -> Observation:
+        """Reset the table.
+
+        setup="default":    robot at a fixed spot, cue ball at the center, targets random.
+        setup="behind_cue": cue ball at a random spot; robot front 3-12 cm behind it along a
+                            random aim line, heading within +/-45 deg of that line; targets
+                            random and non-overlapping.
+        """
         self._space = self._create_space()
         self._ball_bodies.clear()
         self._ball_shapes.clear()
 
         self._add_walls(self._space)
 
-        robot_pos = (-TABLE_LENGTH / 4, 0.0)
-        self._add_robot(self._space, robot_pos, 0.0)
+        if setup == "default":
+            robot_pos, robot_angle = (-TABLE_LENGTH / 4, 0.0), 0.0
+            ball_pos = {"cue": (0.0, 0.0)}
+            for name in ("red", "blue", "yellow"):
+                ball_pos[name] = self._random_table_pos()
+            self.last_setup = {}
+        elif setup == "behind_cue":
+            robot_pos, robot_angle, ball_pos = self._sample_behind_cue_setup()
+        else:
+            raise ValueError(f"Unknown setup: {setup}")
 
-        self._add_ball(self._space, "cue", (0.0, 0.0))
-        self._add_ball(self._space, "red", self._random_table_pos())
-        self._add_ball(self._space, "blue", self._random_table_pos())
-        self._add_ball(self._space, "yellow", self._random_table_pos())
+        self._add_robot(self._space, robot_pos, robot_angle)
+        for name in ("cue", "red", "blue", "yellow"):
+            self._add_ball(self._space, name, ball_pos[name])
 
+        self.last_strike_connected = False
         return self._get_observation()
+
+    @staticmethod
+    def _robot_corners(pos, angle):
+        c, s = math.cos(angle), math.sin(angle)
+        out = []
+        for lx, ly in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+            px, py = lx * ROBOT_LENGTH / 2, ly * ROBOT_WIDTH / 2
+            out.append((pos[0] + c * px - s * py, pos[1] + s * px + c * py))
+        return out
+
+    @staticmethod
+    def _inside_table(x, y, margin):
+        lim_x = TABLE_LENGTH / 2 - CUSHION_THICKNESS - margin
+        lim_y = TABLE_WIDTH / 2 - CUSHION_THICKNESS - margin
+        return abs(x) <= lim_x and abs(y) <= lim_y
+
+    @staticmethod
+    def _overlaps_robot(pt, pos, angle, clearance):
+        """True if pt lies inside the robot box expanded by clearance."""
+        c, s = math.cos(-angle), math.sin(-angle)
+        dx, dy = pt[0] - pos[0], pt[1] - pos[1]
+        lx, ly = c * dx - s * dy, s * dx + c * dy
+        return abs(lx) <= ROBOT_LENGTH / 2 + clearance and abs(ly) <= ROBOT_WIDTH / 2 + clearance
+
+    def _sample_behind_cue_setup(self):
+        ball_margin = BALL_RADIUS + 0.005
+        for _ in range(SETUP_MAX_TRIES):
+            cue = self._random_table_pos(margin=CUSHION_THICKNESS + ball_margin)
+            aim = random.uniform(-math.pi, math.pi)          # direction robot -> cue
+            dist = random.uniform(*SETUP_DISTANCE_RANGE)     # robot front -> cue center
+            offset = random.uniform(*SETUP_AIM_OFFSET_RANGE)
+            heading = aim + offset
+
+            front = (cue[0] - dist * math.cos(aim), cue[1] - dist * math.sin(aim))
+            pos = (front[0] - ROBOT_LENGTH / 2 * math.cos(heading),
+                   front[1] - ROBOT_LENGTH / 2 * math.sin(heading))
+
+            if not all(self._inside_table(x, y, 0.005) for x, y in self._robot_corners(pos, heading)):
+                continue
+            if self._overlaps_robot(cue, pos, heading, BALL_RADIUS):
+                continue  # large aim offsets at short range can put the cue ball inside the robot
+
+            balls = {"cue": cue}
+            ok = True
+            for name in ("red", "blue", "yellow"):
+                for _ in range(100):
+                    q = self._random_table_pos(margin=CUSHION_THICKNESS + ball_margin)
+                    if self._overlaps_robot(q, pos, heading, BALL_RADIUS + 0.005):
+                        continue
+                    if any(math.hypot(q[0] - b[0], q[1] - b[1]) < 2 * BALL_RADIUS + 0.005
+                           for b in balls.values()):
+                        continue
+                    balls[name] = q
+                    break
+                else:
+                    ok = False
+                    break
+            if not ok:
+                continue
+
+            self.last_setup = {"distance": dist, "aim_offset": offset}
+            return pos, heading, balls
+        raise RuntimeError("Could not sample a valid behind_cue setup")
 
     def step(self, action: Action) -> Observation:
         left_pwm = max(-1.0, min(1.0, action["left_pwm"]))
@@ -158,8 +243,11 @@ class SimEnv(BaseEnv):
             cue_pos = self._ball_bodies["cue"].position
             dist = math.hypot(cue_pos.x - robot_front.x, cue_pos.y - robot_front.y)
 
-            if dist < ROBOT_LENGTH / 2 + BALL_RADIUS + 0.02:
+            self.last_strike_connected = dist < ROBOT_LENGTH / 2 + BALL_RADIUS + 0.02
+            if self.last_strike_connected:
                 self._ball_bodies["cue"].apply_impulse_at_local_point(impulse, (0, 0))
+        else:
+            self.last_strike_connected = False
 
         for _ in range(SUBSTEPS):
             self._space.step(DT / SUBSTEPS)
