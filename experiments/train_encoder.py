@@ -12,9 +12,15 @@ Input: each frame has the static table background (median frame over the dataset
 subtracted, so the balls and robot are the signal instead of ~1.4% of the pixels.
 
 Loss (VICReg-style, no SimNorm on the encoder output):
-    PRED_WEIGHT * MSE(predictor(z_t, a_t), target_z_{t+1})
+    PRED_WEIGHT * motion-weighted MSE(predictor(z_t, a_t), target_z_{t+1})
   + VAR_WEIGHT  * mean(relu(1 - std(z_t) per dim))       # keeps every dim spread out
   + COV_WEIGHT  * sum(offdiag(cov(z_t))^2) / dim          # decorrelates dims
+
+Motion weighting: each transition's prediction error is weighted by
+MOTION_WEIGHT_FLOOR + (total ball displacement / mean displacement), using the
+ground-truth ball positions, so transitions where balls move fast dominate the
+prediction term and static frames still contribute a little. (Oversampling to 50%
+moving would be a no-op: ~70-93% of transitions already have a ball moving >5mm.)
 
 Evaluation: holdout latent-prediction loss (early stopping), a collapse check,
 and a linear probe from latents to ground-truth positions and velocities,
@@ -42,7 +48,8 @@ DATA_PATTERNS = ["batch_v3_*.npz", "batch_strike_*.npz"]
 
 EPOCHS = 50
 BATCH_SIZE = 256
-LR = 3e-4
+LR = 1e-4           # was 3e-4; the 432x240 runs diverged at 3e-4
+GRAD_CLIP = 1.0     # max global grad norm
 HOLDOUT_FRACTION = 0.02
 SAVE_EVERY = 10
 EARLY_STOP_PATIENCE = 5
@@ -53,14 +60,19 @@ N_FRAMES = 2  # stacked frames per encoder input
 PROBE_TRAIN_SAMPLES = 5000
 USE_SIMNORM = False
 USE_VICREG = True    # False -> loss is the prediction term only
-PRED_WEIGHT = 25.0   # VICReg paper defaults: invariance 25, variance 25, covariance 1
-VAR_WEIGHT = 25.0
-COV_WEIGHT = 1.0
+# Adam is invariant to a uniform loss scale, so only the ratios matter. Relative to the
+# VICReg defaults (25/25/1), the variance and covariance terms are softened so they push
+# the latent scale around less and the prediction term carries more of the gradient.
+PRED_WEIGHT = 25.0
+VAR_WEIGHT = 15.0
+COV_WEIGHT = 0.5
+MOTION_WEIGHT_FLOOR = 0.1  # weight of a transition with no ball motion (mean-motion transition ~1.1)
 BACKGROUND_SAMPLES = 500
 SEED = 0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 META_KEYS = ["actions_left_pwm", "actions_right_pwm", "actions_fire", "actions_fire_force",
-             "robot_pose_before", "ball_positions_before", "episode_idx", "step_idx"]
+             "robot_pose_before", "ball_positions_before", "ball_positions_after",
+             "episode_idx", "step_idx"]
 
 
 def list_files():
@@ -122,6 +134,9 @@ def load_metadata(files):
                                     meta["ball_positions_before"].reshape(n, -1)], 1)
     meta["prev"], meta["cur"], meta["next"] = (np.concatenate(prev_slot), np.concatenate(cur_slot),
                                                np.concatenate(next_slot))
+    # Total ball displacement over the transition (m), summed over the 4 balls.
+    meta["ball_disp"] = np.linalg.norm(
+        meta["ball_positions_after"] - meta["ball_positions_before"], axis=-1).sum(-1)
     meta["episode"] = np.concatenate(global_ep)
     meta["n_slots"] = int(slot_offset)
     return meta, file_slots
@@ -225,6 +240,12 @@ def check_collapse(encoder, frames, prev, cur):
     return mean_std, pairwise[np.triu_indices(8, k=1)].mean()
 
 
+def weighted_pred_loss(pred, target, w):
+    """Per-transition MSE over latent dims, averaged with weights w (B,)."""
+    per_sample = ((pred - target) ** 2).mean(1)
+    return (w * per_sample).sum() / w.sum()
+
+
 def evaluate_holdout(encoder, target_encoder, predictor, frames, meta, rows):
     """Holdout loss with the same weighting as training (pred + VICReg var/cov).
 
@@ -242,8 +263,9 @@ def evaluate_holdout(encoder, target_encoder, predictor, frames, meta, rows):
             x_t = stack_frames(frames, meta["prev"][r], meta["cur"][r]).to(DEVICE)
             x_tp1 = stack_frames(frames, meta["cur"][r], meta["next"][r]).to(DEVICE)
             act = torch.from_numpy(meta["actions"][r]).to(DEVICE)
+            w = torch.from_numpy(meta["motion_w"][r]).to(DEVICE)
             z_t = encoder(x_t)
-            pred = nn.functional.mse_loss(predictor(z_t, act), target_encoder(x_tp1)).item()
+            pred = weighted_pred_loss(predictor(z_t, act), target_encoder(x_tp1), w).item()
             if USE_VICREG:
                 var_loss, cov_loss = vicreg_terms(z_t)
                 total += len(r) * (PRED_WEIGHT * pred + VAR_WEIGHT * var_loss.item()
@@ -314,6 +336,13 @@ def train():
     probe_rows = rng.choice(train_rows, min(PROBE_TRAIN_SAMPLES, len(train_rows)), replace=False)
     collapse_rows = np.sort(rng.choice(hold_rows, min(64, len(hold_rows)), replace=False))
 
+    disp = meta["ball_disp"]
+    meta["motion_w"] = (MOTION_WEIGHT_FLOOR + disp / disp[train_rows].mean()).astype(np.float32)
+    w_tr = meta["motion_w"][train_rows]
+    moving = disp[train_rows] > 5e-3
+    print(f"Ball motion: {100 * moving.mean():.1f}% of train transitions move >5mm; "
+          f"they carry {100 * w_tr[moving].sum() / w_tr.sum():.1f}% of the prediction-loss weight")
+
     in_ch = 3 * N_FRAMES
     encoder = make_encoder(in_ch)
     target_encoder = make_encoder(in_ch)
@@ -324,7 +353,8 @@ def train():
 
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,} (input {in_ch} channels)")
     print(f"Predictor params: {sum(p.numel() for p in predictor.parameters()):,}")
-    print(f"EMA tau: {EMA_TAU}  Device: {DEVICE}  Threads: {torch.get_num_threads()}")
+    print(f"EMA tau: {EMA_TAU}  LR: {LR}  Grad clip: {GRAD_CLIP}  Device: {DEVICE}  "
+          f"Threads: {torch.get_num_threads()}")
     print(f"SimNorm: {USE_SIMNORM}  VICReg: {USE_VICREG}"
           + (f"  Loss weights: pred={PRED_WEIGHT} var={VAR_WEIGHT} cov={COV_WEIGHT}" if USE_VICREG else ""))
     print(f"Train: {len(train_rows)}, Holdout: {len(hold_rows)} ({len(hold_eps)} episodes)")
@@ -350,12 +380,13 @@ def train():
             x_t = stack_frames(frames, meta["prev"][r], meta["cur"][r]).to(DEVICE)
             x_tp1 = stack_frames(frames, meta["cur"][r], meta["next"][r]).to(DEVICE)
             act = torch.from_numpy(meta["actions"][r]).to(DEVICE)
+            w = torch.from_numpy(meta["motion_w"][r]).to(DEVICE)
 
             z_t = encoder(x_t)
             z_tp1_pred = predictor(z_t, act)
             with torch.no_grad():
                 z_tp1_target = target_encoder(x_tp1)
-            pred_loss = nn.functional.mse_loss(z_tp1_pred, z_tp1_target)
+            pred_loss = weighted_pred_loss(z_tp1_pred, z_tp1_target, w)
             var_loss, cov_loss = vicreg_terms(z_t)  # always logged; only in the loss with USE_VICREG
             if USE_VICREG:
                 loss = PRED_WEIGHT * pred_loss + VAR_WEIGHT * var_loss + COV_WEIGHT * cov_loss
@@ -367,6 +398,8 @@ def train():
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(predictor.parameters()), GRAD_CLIP)
             optimizer.step()
 
             with torch.no_grad():
