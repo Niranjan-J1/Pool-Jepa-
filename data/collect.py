@@ -67,10 +67,12 @@ def sample_fire_steps(cfg):
     return set(random.sample(range(lo, hi + 1), n_fires))
 
 
-def collect(mode="random_drive", episodes=None):
+def collect(mode="random_drive", episodes=None, prefix=None):
     cfg = dict(MODES[mode])
     if episodes is not None:
         cfg["episodes"] = episodes
+    if prefix is not None:
+        cfg["prefix"] = prefix
     n_episodes, n_steps, prefix = cfg["episodes"], cfg["steps"], cfg["prefix"]
     print(f"Mode: {mode}  episodes={n_episodes}  steps/episode={n_steps}  -> {prefix}_XXX.npz")
 
@@ -146,5 +148,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=list(MODES), default="random_drive")
     parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--prefix", default=None, help="Override the output file prefix")
     args = parser.parse_args()
-    collect(args.mode, args.episodes)
+    collect(args.mode, args.episodes, args.prefix)

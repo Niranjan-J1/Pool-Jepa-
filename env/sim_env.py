@@ -41,6 +41,12 @@ SETUP_DISTANCE_RANGE = (0.03, 0.07)       # m, robot front -> cue ball center
 SETUP_AIM_OFFSET_RANGE = (-math.pi / 4, math.pi / 4)  # heading offset from the aim line
 SETUP_MAX_TRIES = 1000
 
+# Rendering. The view spans the table plus a margin; frames are table-shaped (not square).
+# At 432 px across a 0.7204 m view -> 600 px/m -> balls are 12 px across.
+RENDER_WIDTH = 432
+RENDER_HEIGHT = 240
+RENDER_MARGIN = 0.03  # m beyond the table on each side (x); y margin is set by the aspect ratio
+
 # Simulation
 DT = 1 / 60.0
 SUBSTEPS = 10
@@ -278,10 +284,14 @@ class SimEnv(BaseEnv):
         )
 
     def render(self) -> np.ndarray:
-        fig, ax = plt.subplots(1, 1, figsize=(2, 2), dpi=64)
-        ax.set_xlim(-TABLE_LENGTH / 2 - 0.03, TABLE_LENGTH / 2 + 0.03)
-        ax.set_ylim(-TABLE_WIDTH / 2 - 0.03, TABLE_WIDTH / 2 + 0.03)
-        ax.set_aspect("equal")
+        """Return a (RENDER_HEIGHT, RENDER_WIDTH, 3) uint8 frame at a uniform px/m scale."""
+        dpi = 100
+        fig = plt.figure(figsize=(RENDER_WIDTH / dpi, RENDER_HEIGHT / dpi), dpi=dpi)
+        ax = fig.add_axes([0, 0, 1, 1])
+        half_w = TABLE_LENGTH / 2 + RENDER_MARGIN
+        half_h = half_w * RENDER_HEIGHT / RENDER_WIDTH
+        ax.set_xlim(-half_w, half_w)
+        ax.set_ylim(-half_h, half_h)
         ax.set_facecolor("#1a5c2a")
         ax.axis("off")
         fig.patch.set_facecolor("#1a5c2a")
@@ -353,17 +363,12 @@ class SimEnv(BaseEnv):
             linewidth=1.5,
         )
 
-        fig.tight_layout(pad=0)
         fig.canvas.draw()
-
         buf = fig.canvas.buffer_rgba()
         img = np.asarray(buf)[:, :, :3].copy()
         plt.close(fig)
-
-        from PIL import Image
-        pil_img = Image.fromarray(img)
-        pil_img = pil_img.resize((128, 128), Image.LANCZOS)
-        return np.array(pil_img, dtype=np.uint8)
+        assert img.shape == (RENDER_HEIGHT, RENDER_WIDTH, 3), img.shape
+        return img
 
 
 if __name__ == "__main__":

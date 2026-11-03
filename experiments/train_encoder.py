@@ -52,10 +52,11 @@ LATENT_DIM = 64
 N_FRAMES = 2  # stacked frames per encoder input
 PROBE_TRAIN_SAMPLES = 5000
 USE_SIMNORM = False
+USE_VICREG = True    # False -> loss is the prediction term only
 PRED_WEIGHT = 25.0   # VICReg paper defaults: invariance 25, variance 25, covariance 1
 VAR_WEIGHT = 25.0
 COV_WEIGHT = 1.0
-BACKGROUND_SAMPLES = 2000
+BACKGROUND_SAMPLES = 500
 SEED = 0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 META_KEYS = ["actions_left_pwm", "actions_right_pwm", "actions_fire", "actions_fire_force",
@@ -135,10 +136,12 @@ def build_frame_cache(files, file_slots, n_slots):
                 print(f"Using frame cache {CACHE_PATH}")
                 return np.load(CACHE_PATH, mmap_mode="r")
 
-    print(f"Building frame cache ({n_slots} frames, {n_slots * 128 * 128 * 3 / 1e9:.1f} GB on disk)...")
+    frame_shape = tuple(int(x) for x in np.load(files[0])["frames_before"].shape[1:])
+    print(f"Building frame cache ({n_slots} frames of {frame_shape}, "
+          f"{n_slots * np.prod(frame_shape) / 1e9:.1f} GB on disk)...")
     t0 = time.time()
     cache = np.lib.format.open_memmap(CACHE_PATH, mode="w+", dtype=np.uint8,
-                                      shape=(n_slots, 128, 128, 3))
+                                      shape=(n_slots, *frame_shape))
     for f, (before_slots, last_rows, last_after_slots) in zip(files, file_slots):
         d = np.load(f)
         cache[before_slots] = d["frames_before"]
@@ -152,9 +155,12 @@ def build_frame_cache(files, file_slots, n_slots):
     return np.load(CACHE_PATH, mmap_mode="r")
 
 
+FRAME_HW = None  # (H, W), set in train() from the data
+
+
 def make_encoder(in_ch):
     return VisualEncoder(latent_dim=LATENT_DIM, num_simplices=8, in_channels=in_ch,
-                         use_simnorm=USE_SIMNORM).to(DEVICE)
+                         use_simnorm=USE_SIMNORM, input_hw=FRAME_HW).to(DEVICE)
 
 
 def compute_background(frames, cache_sig):
@@ -165,7 +171,10 @@ def compute_background(frames, cache_sig):
             if json.load(fh) == cache_sig:
                 return np.load(BACKGROUND_PATH)
     idx = np.linspace(0, len(frames) - 1, min(BACKGROUND_SAMPLES, len(frames))).astype(np.int64)
-    bg = np.median(frames[idx], axis=0).astype(np.float32)
+    h = frames.shape[1]
+    bg = np.empty(frames.shape[1:], dtype=np.float32)
+    for r0 in range(0, h, 16):  # row chunks keep the median's temporary copies small
+        bg[r0:r0 + 16] = np.median(frames[idx, r0:r0 + 16], axis=0)
     np.save(BACKGROUND_PATH, bg)
     with open(sig_path, "w") as fh:
         json.dump(cache_sig, fh)
@@ -235,8 +244,12 @@ def evaluate_holdout(encoder, target_encoder, predictor, frames, meta, rows):
             act = torch.from_numpy(meta["actions"][r]).to(DEVICE)
             z_t = encoder(x_t)
             pred = nn.functional.mse_loss(predictor(z_t, act), target_encoder(x_tp1)).item()
-            var_loss, cov_loss = vicreg_terms(z_t)
-            total += len(r) * (PRED_WEIGHT * pred + VAR_WEIGHT * var_loss.item() + COV_WEIGHT * cov_loss.item())
+            if USE_VICREG:
+                var_loss, cov_loss = vicreg_terms(z_t)
+                total += len(r) * (PRED_WEIGHT * pred + VAR_WEIGHT * var_loss.item()
+                                   + COV_WEIGHT * cov_loss.item())
+            else:
+                total += len(r) * pred
             pred_total += len(r) * pred
             n += len(r)
     encoder.train()
@@ -286,8 +299,10 @@ def train():
     files = list_files()
     meta, file_slots = load_metadata(files)
     frames = build_frame_cache(files, file_slots, meta["n_slots"])
-    global BACKGROUND
+    global BACKGROUND, FRAME_HW
     BACKGROUND = torch.from_numpy(compute_background(frames, file_signature(files)))
+    FRAME_HW = tuple(int(x) for x in frames.shape[1:3])
+    print(f"Frame size: {FRAME_HW[0]}x{FRAME_HW[1]}")
     n = len(meta["cur"])
     print(f"Loaded {n} transitions from {len(files)} files ({meta['n_slots']} distinct frames)")
 
@@ -297,6 +312,7 @@ def train():
     is_hold = np.isin(meta["episode"], hold_eps)
     train_rows, hold_rows = np.where(~is_hold)[0], np.where(is_hold)[0]
     probe_rows = rng.choice(train_rows, min(PROBE_TRAIN_SAMPLES, len(train_rows)), replace=False)
+    collapse_rows = np.sort(rng.choice(hold_rows, min(64, len(hold_rows)), replace=False))
 
     in_ch = 3 * N_FRAMES
     encoder = make_encoder(in_ch)
@@ -309,7 +325,8 @@ def train():
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,} (input {in_ch} channels)")
     print(f"Predictor params: {sum(p.numel() for p in predictor.parameters()):,}")
     print(f"EMA tau: {EMA_TAU}  Device: {DEVICE}  Threads: {torch.get_num_threads()}")
-    print(f"SimNorm: {USE_SIMNORM}  Loss weights: pred={PRED_WEIGHT} var={VAR_WEIGHT} cov={COV_WEIGHT}")
+    print(f"SimNorm: {USE_SIMNORM}  VICReg: {USE_VICREG}"
+          + (f"  Loss weights: pred={PRED_WEIGHT} var={VAR_WEIGHT} cov={COV_WEIGHT}" if USE_VICREG else ""))
     print(f"Train: {len(train_rows)}, Holdout: {len(hold_rows)} ({len(hold_eps)} episodes)")
 
     print("\nLinear probe on the untrained encoder (reference):")
@@ -339,8 +356,11 @@ def train():
             with torch.no_grad():
                 z_tp1_target = target_encoder(x_tp1)
             pred_loss = nn.functional.mse_loss(z_tp1_pred, z_tp1_target)
-            var_loss, cov_loss = vicreg_terms(z_t)
-            loss = PRED_WEIGHT * pred_loss + VAR_WEIGHT * var_loss + COV_WEIGHT * cov_loss
+            var_loss, cov_loss = vicreg_terms(z_t)  # always logged; only in the loss with USE_VICREG
+            if USE_VICREG:
+                loss = PRED_WEIGHT * pred_loss + VAR_WEIGHT * var_loss + COV_WEIGHT * cov_loss
+            else:
+                loss = pred_loss
             sums["pred"] += pred_loss.item()
             sums["var"] += var_loss.item()
             sums["cov"] += cov_loss.item()
@@ -359,7 +379,7 @@ def train():
         avg_loss = epoch_loss / n_batches
         elapsed = time.time() - t0
         holdout_loss, holdout_pred = evaluate_holdout(encoder, target_encoder, predictor, frames, meta, hold_rows)
-        latent_std, latent_dist = check_collapse(encoder, frames, meta["prev"][hold_rows], meta["cur"][hold_rows])
+        latent_std, latent_dist = check_collapse(encoder, frames, meta["prev"][collapse_rows], meta["cur"][collapse_rows])
         collapsed = "COLLAPSED" if latent_dist < 0.01 else "ok"
 
         parts = "  ".join(f"{k}={v / n_batches:.4f}" for k, v in sums.items())

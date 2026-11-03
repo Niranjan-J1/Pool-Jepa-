@@ -20,7 +20,7 @@ class SimNorm(nn.Module):
 
 
 class VisualEncoder(nn.Module):
-    """Small CNN encoder: 128x128x(3*k) -> 64-dim latent.
+    """Small CNN encoder: HxWx(3*k) frames -> 64-dim latent.
 
     in_channels=3 encodes a single RGB frame; in_channels=6 encodes two stacked frames
     (previous, current) so the latent can carry velocity.
@@ -29,7 +29,7 @@ class VisualEncoder(nn.Module):
     """
 
     def __init__(self, latent_dim: int = 64, num_simplices: int = 8, in_channels: int = 3,
-                 use_simnorm: bool = True):
+                 use_simnorm: bool = True, input_hw: tuple[int, int] = (128, 128)):
         super().__init__()
         self.latent_dim = latent_dim
         self.in_channels = in_channels
@@ -44,8 +44,9 @@ class VisualEncoder(nn.Module):
             nn.Conv2d(128, 256, 3, stride=2, padding=1),
             nn.ReLU(),
         )
-        # 128 / (2^4) = 8, so output is (batch, 256, 8, 8)
-        self.flatten_dim = 256 * 8 * 8
+        # Four stride-2 convs: 128x128 -> 8x8, 240x432 -> 15x27.
+        with torch.no_grad():
+            self.flatten_dim = self.conv(torch.zeros(1, in_channels, *input_hw)).numel()
 
         self.projection = nn.Linear(self.flatten_dim, latent_dim)
         self.norm = SimNorm(latent_dim, num_simplices) if use_simnorm else nn.Identity()
