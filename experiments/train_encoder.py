@@ -11,7 +11,18 @@ around one batch rather than the whole dataset.
 Input: each frame has the static table background (median frame over the dataset)
 subtracted, so the balls and robot are the signal instead of ~1.4% of the pixels.
 
-Loss (VICReg-style, no SimNorm on the encoder output):
+Encoder head (ENCODER_HEAD / --head):
+    "spatial_softmax" (default): conv features -> per-channel softmax over pixels ->
+        expected (x, y) per channel. The latent is 32 keypoint coordinates in [-1, 1],
+        so small objects get localized instead of averaged away, and the latent scale
+        is bounded (the targets cannot blow up).
+    "linear": the earlier flatten + linear projection.
+
+Target warmup: for the first TARGET_WARMUP_EPOCHS epochs the target encoder is frozen
+at its initial weights (no EMA updates), so the predictor first learns against a
+fixed target. EMA updates start afterwards.
+
+Loss (VICReg terms optional, off by default with spatial softmax):
     PRED_WEIGHT * motion-weighted MSE(predictor(z_t, a_t), target_z_{t+1})
   + VAR_WEIGHT  * mean(relu(1 - std(z_t) per dim))       # keeps every dim spread out
   + COV_WEIGHT  * sum(offdiag(cov(z_t))^2) / dim          # decorrelates dims
@@ -48,7 +59,7 @@ DATA_PATTERNS = ["batch_v3_*.npz", "batch_strike_*.npz"]
 
 EPOCHS = 50
 BATCH_SIZE = 256
-LR = 1e-4           # was 3e-4; the 432x240 runs diverged at 3e-4
+LR = 1e-4           # was 3e-4; the 432x240 runs diverged. Try 3e-5 (--lr) if it still does.
 GRAD_CLIP = 1.0     # max global grad norm
 HOLDOUT_FRACTION = 0.02
 SAVE_EVERY = 10
@@ -59,13 +70,18 @@ LATENT_DIM = 64
 N_FRAMES = 2  # stacked frames per encoder input
 PROBE_TRAIN_SAMPLES = 5000
 USE_SIMNORM = False
-USE_VICREG = True    # False -> loss is the prediction term only
+USE_VICREG = False   # off by default: spatial-softmax keypoints resist collapse (--vicreg to enable)
+ENCODER_HEAD = "spatial_softmax"  # or "linear"
+TARGET_WARMUP_EPOCHS = 1  # target encoder frozen (no EMA) for these epochs
 # Adam is invariant to a uniform loss scale, so only the ratios matter. Relative to the
 # VICReg defaults (25/25/1), the variance and covariance terms are softened so they push
 # the latent scale around less and the prediction term carries more of the gradient.
 PRED_WEIGHT = 25.0
 VAR_WEIGHT = 15.0
 COV_WEIGHT = 0.5
+# Variance-hinge target std per latent dim. 1.0 is the VICReg default (unbounded latents);
+# spatial-softmax coordinates live in [-1, 1] (uniform spread ~0.58), so they use 0.3.
+VAR_TARGET = {"linear": 1.0, "spatial_softmax": 0.3}
 MOTION_WEIGHT_FLOOR = 0.1  # weight of a transition with no ball motion (mean-motion transition ~1.1)
 BACKGROUND_SAMPLES = 500
 SEED = 0
@@ -175,7 +191,7 @@ FRAME_HW = None  # (H, W), set in train() from the data
 
 def make_encoder(in_ch):
     return VisualEncoder(latent_dim=LATENT_DIM, num_simplices=8, in_channels=in_ch,
-                         use_simnorm=USE_SIMNORM, input_hw=FRAME_HW).to(DEVICE)
+                         use_simnorm=USE_SIMNORM, input_hw=FRAME_HW, head=ENCODER_HEAD).to(DEVICE)
 
 
 def compute_background(frames, cache_sig):
@@ -215,7 +231,7 @@ def vicreg_terms(z):
     """Variance hinge and covariance penalty on a batch of latents (B, D)."""
     z = z - z.mean(0)
     std = torch.sqrt(z.var(0) + 1e-4)
-    var_loss = torch.relu(1.0 - std).mean()
+    var_loss = torch.relu(VAR_TARGET[ENCODER_HEAD] - std).mean()
     cov = (z.T @ z) / (z.shape[0] - 1)
     off = cov - torch.diag(torch.diag(cov))
     cov_loss = (off ** 2).sum() / z.shape[1]
@@ -355,7 +371,8 @@ def train():
     print(f"Predictor params: {sum(p.numel() for p in predictor.parameters()):,}")
     print(f"EMA tau: {EMA_TAU}  LR: {LR}  Grad clip: {GRAD_CLIP}  Device: {DEVICE}  "
           f"Threads: {torch.get_num_threads()}")
-    print(f"SimNorm: {USE_SIMNORM}  VICReg: {USE_VICREG}"
+    print(f"Head: {ENCODER_HEAD}  Target warmup epochs: {TARGET_WARMUP_EPOCHS}")
+    print(f"SimNorm: {USE_SIMNORM and ENCODER_HEAD == 'linear'}  VICReg: {USE_VICREG}"
           + (f"  Loss weights: pred={PRED_WEIGHT} var={VAR_WEIGHT} cov={COV_WEIGHT}" if USE_VICREG else ""))
     print(f"Train: {len(train_rows)}, Holdout: {len(hold_rows)} ({len(hold_eps)} episodes)")
 
@@ -402,9 +419,10 @@ def train():
                 list(encoder.parameters()) + list(predictor.parameters()), GRAD_CLIP)
             optimizer.step()
 
-            with torch.no_grad():
-                for p, tp in zip(encoder.parameters(), target_encoder.parameters()):
-                    tp.data.lerp_(p.data, EMA_TAU)
+            if epoch > TARGET_WARMUP_EPOCHS:
+                with torch.no_grad():
+                    for p, tp in zip(encoder.parameters(), target_encoder.parameters()):
+                        tp.data.lerp_(p.data, EMA_TAU)
 
             epoch_loss += loss.item()
             n_batches += 1
@@ -449,4 +467,18 @@ def train():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--head", choices=["spatial_softmax", "linear"], default=ENCODER_HEAD)
+    parser.add_argument("--vicreg", action="store_true", default=USE_VICREG,
+                        help="Add VICReg variance/covariance terms to the loss")
+    parser.add_argument("--warmup-epochs", type=int, default=TARGET_WARMUP_EPOCHS,
+                        help="Epochs with a frozen target encoder before EMA updates start")
+    args = parser.parse_args()
+    LR, EPOCHS, BATCH_SIZE = args.lr, args.epochs, args.batch_size
+    ENCODER_HEAD, USE_VICREG, TARGET_WARMUP_EPOCHS = args.head, args.vicreg, args.warmup_epochs
     train()
