@@ -8,6 +8,14 @@ Memory: every distinct frame is written once to a uint8 cache file on disk
 (data/datasets/frames_cache.npy) and read back memory-mapped, so RAM use stays
 around one batch rather than the whole dataset.
 
+Input: each frame has the static table background (median frame over the dataset)
+subtracted, so the balls and robot are the signal instead of ~1.4% of the pixels.
+
+Loss (VICReg-style, no SimNorm on the encoder output):
+    PRED_WEIGHT * MSE(predictor(z_t, a_t), target_z_{t+1})
+  + VAR_WEIGHT  * mean(relu(1 - std(z_t) per dim))       # keeps every dim spread out
+  + COV_WEIGHT  * sum(offdiag(cov(z_t))^2) / dim          # decorrelates dims
+
 Evaluation: holdout latent-prediction loss (early stopping), a collapse check,
 and a linear probe from latents to ground-truth positions and velocities,
 compared against the same probe on an untrained encoder.
@@ -29,6 +37,7 @@ DATASETS_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "datasets")
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "checkpoints")
 CACHE_PATH = os.path.join(DATASETS_DIR, "frames_cache.npy")
 CACHE_META_PATH = os.path.join(DATASETS_DIR, "frames_cache_meta.json")
+BACKGROUND_PATH = os.path.join(DATASETS_DIR, "frames_background.npy")
 DATA_PATTERNS = ["batch_v3_*.npz", "batch_strike_*.npz"]
 
 EPOCHS = 50
@@ -42,6 +51,11 @@ EMA_TAU = 0.005
 LATENT_DIM = 64
 N_FRAMES = 2  # stacked frames per encoder input
 PROBE_TRAIN_SAMPLES = 5000
+USE_SIMNORM = False
+PRED_WEIGHT = 25.0   # VICReg paper defaults: invariance 25, variance 25, covariance 1
+VAR_WEIGHT = 25.0
+COV_WEIGHT = 1.0
+BACKGROUND_SAMPLES = 2000
 SEED = 0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 META_KEYS = ["actions_left_pwm", "actions_right_pwm", "actions_fire", "actions_fire_force",
@@ -138,14 +152,50 @@ def build_frame_cache(files, file_slots, n_slots):
     return np.load(CACHE_PATH, mmap_mode="r")
 
 
+def make_encoder(in_ch):
+    return VisualEncoder(latent_dim=LATENT_DIM, num_simplices=8, in_channels=in_ch,
+                         use_simnorm=USE_SIMNORM).to(DEVICE)
+
+
+def compute_background(frames, cache_sig):
+    """Per-pixel median over a spread-out sample of frames = the empty table."""
+    sig_path = BACKGROUND_PATH + ".json"
+    if os.path.exists(BACKGROUND_PATH) and os.path.exists(sig_path):
+        with open(sig_path) as fh:
+            if json.load(fh) == cache_sig:
+                return np.load(BACKGROUND_PATH)
+    idx = np.linspace(0, len(frames) - 1, min(BACKGROUND_SAMPLES, len(frames))).astype(np.int64)
+    bg = np.median(frames[idx], axis=0).astype(np.float32)
+    np.save(BACKGROUND_PATH, bg)
+    with open(sig_path, "w") as fh:
+        json.dump(cache_sig, fh)
+    return bg
+
+
+BACKGROUND = None  # (128, 128, 3) float32 tensor in [0, 255], set in train()
+
+
 def stack_frames(frames, idx_a, idx_b):
-    """(B,) slot indices -> float tensor (B, 6, 128, 128) in [0, 1]: [frame a | frame b]."""
+    """(B,) slot indices -> float tensor (B, 6, 128, 128): background-subtracted [frame a | frame b].
+
+    Values are in [-1, 1]; static table pixels are ~0.
+    """
     order = np.argsort(idx_a)  # sorted reads are friendlier to the memory map
     inv = np.argsort(order)
-    a = frames[idx_a[order]][inv]
-    b = frames[idx_b[order]][inv]
-    x = torch.from_numpy(np.concatenate([a, b], axis=-1))
-    return x.permute(0, 3, 1, 2).float().div_(255.0)
+    a = torch.from_numpy(frames[idx_a[order]][inv]).float().sub_(BACKGROUND)
+    b = torch.from_numpy(frames[idx_b[order]][inv]).float().sub_(BACKGROUND)
+    return torch.cat([a, b], dim=-1).permute(0, 3, 1, 2).div_(255.0)
+
+
+def vicreg_terms(z):
+    """Variance hinge and covariance penalty on a batch of latents (B, D)."""
+    z = z - z.mean(0)
+    std = torch.sqrt(z.var(0) + 1e-4)
+    var_loss = torch.relu(1.0 - std).mean()
+    cov = (z.T @ z) / (z.shape[0] - 1)
+    off = cov - torch.diag(torch.diag(cov))
+    cov_loss = (off ** 2).sum() / z.shape[1]
+    return var_loss, cov_loss
 
 
 def encode(encoder, frames, prev, cur, batch=512):
@@ -167,21 +217,31 @@ def check_collapse(encoder, frames, prev, cur):
 
 
 def evaluate_holdout(encoder, target_encoder, predictor, frames, meta, rows):
-    """Mean latent-prediction MSE on held-out transitions."""
+    """Holdout loss with the same weighting as training (pred + VICReg var/cov).
+
+    Returns (total, pred_mse). Early stopping uses the total: the prediction term alone
+    can rise simply because the variance term spreads the latents out.
+    """
     encoder.eval()
     predictor.eval()
-    total = 0.0
+    total, pred_total, n = 0.0, 0.0, 0
     with torch.no_grad():
         for i in range(0, len(rows), BATCH_SIZE):
             r = rows[i:i + BATCH_SIZE]
+            if len(r) < 2:
+                continue
             x_t = stack_frames(frames, meta["prev"][r], meta["cur"][r]).to(DEVICE)
             x_tp1 = stack_frames(frames, meta["cur"][r], meta["next"][r]).to(DEVICE)
             act = torch.from_numpy(meta["actions"][r]).to(DEVICE)
-            pred = predictor(encoder(x_t), act)
-            total += nn.functional.mse_loss(pred, target_encoder(x_tp1), reduction="sum").item() / LATENT_DIM
+            z_t = encoder(x_t)
+            pred = nn.functional.mse_loss(predictor(z_t, act), target_encoder(x_tp1)).item()
+            var_loss, cov_loss = vicreg_terms(z_t)
+            total += len(r) * (PRED_WEIGHT * pred + VAR_WEIGHT * var_loss.item() + COV_WEIGHT * cov_loss.item())
+            pred_total += len(r) * pred
+            n += len(r)
     encoder.train()
     predictor.train()
-    return total / len(rows)
+    return total / n, pred_total / n
 
 
 def linear_probe(encoder, frames, meta, train_rows, hold_rows):
@@ -226,6 +286,8 @@ def train():
     files = list_files()
     meta, file_slots = load_metadata(files)
     frames = build_frame_cache(files, file_slots, meta["n_slots"])
+    global BACKGROUND
+    BACKGROUND = torch.from_numpy(compute_background(frames, file_signature(files)))
     n = len(meta["cur"])
     print(f"Loaded {n} transitions from {len(files)} files ({meta['n_slots']} distinct frames)")
 
@@ -237,8 +299,8 @@ def train():
     probe_rows = rng.choice(train_rows, min(PROBE_TRAIN_SAMPLES, len(train_rows)), replace=False)
 
     in_ch = 3 * N_FRAMES
-    encoder = VisualEncoder(latent_dim=LATENT_DIM, num_simplices=8, in_channels=in_ch).to(DEVICE)
-    target_encoder = VisualEncoder(latent_dim=LATENT_DIM, num_simplices=8, in_channels=in_ch).to(DEVICE)
+    encoder = make_encoder(in_ch)
+    target_encoder = make_encoder(in_ch)
     target_encoder.load_state_dict(encoder.state_dict())
     for p in target_encoder.parameters():
         p.requires_grad = False
@@ -247,6 +309,7 @@ def train():
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,} (input {in_ch} channels)")
     print(f"Predictor params: {sum(p.numel() for p in predictor.parameters()):,}")
     print(f"EMA tau: {EMA_TAU}  Device: {DEVICE}  Threads: {torch.get_num_threads()}")
+    print(f"SimNorm: {USE_SIMNORM}  Loss weights: pred={PRED_WEIGHT} var={VAR_WEIGHT} cov={COV_WEIGHT}")
     print(f"Train: {len(train_rows)}, Holdout: {len(hold_rows)} ({len(hold_eps)} episodes)")
 
     print("\nLinear probe on the untrained encoder (reference):")
@@ -261,6 +324,7 @@ def train():
         encoder.train()
         predictor.train()
         epoch_loss, n_batches = 0.0, 0
+        sums = {"pred": 0.0, "var": 0.0, "cov": 0.0}
         t0 = time.time()
         perm = rng.permutation(train_rows)
 
@@ -270,10 +334,16 @@ def train():
             x_tp1 = stack_frames(frames, meta["cur"][r], meta["next"][r]).to(DEVICE)
             act = torch.from_numpy(meta["actions"][r]).to(DEVICE)
 
-            z_tp1_pred = predictor(encoder(x_t), act)
+            z_t = encoder(x_t)
+            z_tp1_pred = predictor(z_t, act)
             with torch.no_grad():
                 z_tp1_target = target_encoder(x_tp1)
-            loss = nn.functional.mse_loss(z_tp1_pred, z_tp1_target)
+            pred_loss = nn.functional.mse_loss(z_tp1_pred, z_tp1_target)
+            var_loss, cov_loss = vicreg_terms(z_t)
+            loss = PRED_WEIGHT * pred_loss + VAR_WEIGHT * var_loss + COV_WEIGHT * cov_loss
+            sums["pred"] += pred_loss.item()
+            sums["var"] += var_loss.item()
+            sums["cov"] += cov_loss.item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -288,11 +358,12 @@ def train():
 
         avg_loss = epoch_loss / n_batches
         elapsed = time.time() - t0
-        holdout_loss = evaluate_holdout(encoder, target_encoder, predictor, frames, meta, hold_rows)
+        holdout_loss, holdout_pred = evaluate_holdout(encoder, target_encoder, predictor, frames, meta, hold_rows)
         latent_std, latent_dist = check_collapse(encoder, frames, meta["prev"][hold_rows], meta["cur"][hold_rows])
         collapsed = "COLLAPSED" if latent_dist < 0.01 else "ok"
 
-        print(f"Epoch {epoch:3d}/{EPOCHS}  loss={avg_loss:.6f}  holdout={holdout_loss:.6f}  "
+        parts = "  ".join(f"{k}={v / n_batches:.4f}" for k, v in sums.items())
+        print(f"Epoch {epoch:3d}/{EPOCHS}  loss={avg_loss:.4f} ({parts})  holdout={holdout_loss:.4f} (pred={holdout_pred:.4f})  "
               f"latent_std={latent_std:.4f}  latent_dist={latent_dist:.4f}  "
               f"[{collapsed}]  ({elapsed:.1f}s)", flush=True)
 
@@ -316,7 +387,7 @@ def train():
     print(f"Saved final predictor to {pred_path}")
 
     print("\n--- Linear probe: latent -> ground truth (holdout R^2, 1.0 = perfect) ---")
-    best = VisualEncoder(latent_dim=LATENT_DIM, num_simplices=8, in_channels=in_ch).to(DEVICE)
+    best = make_encoder(in_ch)
     best.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "encoder_best.pt"), map_location=DEVICE))
     trained_r2 = linear_probe(best, frames, meta, probe_rows, hold_rows)
     print(f"{'target':>10} {'trained':>9} {'untrained':>10}")
