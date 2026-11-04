@@ -23,6 +23,7 @@ Run the test (needs the trained spatial-softmax encoder + predictor in data/chec
     python planning/cem.py --checkpoint-dir path/to/ckpts --suffix ""   # final instead of best
 """
 import argparse
+import json
 import math
 import os
 import sys
@@ -32,7 +33,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from perception.encoder import LatentPredictor, VisualEncoder
+from perception.encoder import LatentPredictor, VisualEncoder, load_predictor
 
 ACTION_DIM = 4
 # Per-dimension action bounds: left_pwm, right_pwm, fire (prob-like), fire_force
@@ -233,13 +234,17 @@ def make_spatial_encoder(device):
                          input_hw=(RENDER_HEIGHT, RENDER_WIDTH), head="spatial_softmax").to(device)
 
 
-def load_models(device, untrained=False, checkpoint_dir=CHECKPOINT_DIR, suffix="_best"):
-    """Returns (encoder, goal_encoder, predictor).
+def load_models(device, untrained=False, checkpoint_dir=CHECKPOINT_DIR, suffix="_best",
+                predictor_name=None):
+    """Returns (state_encoder, goal_encoder, predictor).
 
-    encoder      = online encoder: produces z_t, the predictor's INPUT during training.
-    goal_encoder = EMA target encoder: the predictor was trained to OUTPUT its latents,
-                   so goals and "actual" next latents must be encoded with it.
-    Older checkpoints have no target encoder; the online one is used with a warning.
+    Joint-trained predictor (predictor{suffix}.pt, from train_encoder.py):
+        state_encoder = online encoder (the predictor's INPUT space in training)
+        goal_encoder  = EMA target encoder (its OUTPUT space), for goals / actual latents.
+        Older checkpoints have no target encoder; the online one is used with a warning.
+    Residual predictor (predictor_residual{suffix}.pt, from train_predictor.py):
+        trained on one frozen encoder (named in its .json), used for both.
+    predictor_name=None picks predictor_residual{suffix}.pt if it exists, else predictor{suffix}.pt.
     """
     encoder = make_spatial_encoder(device)
     predictor = LatentPredictor(latent_dim=LATENT_DIM, action_dim=ACTION_DIM, hidden_dim=128).to(device)
@@ -257,13 +262,31 @@ def load_models(device, untrained=False, checkpoint_dir=CHECKPOINT_DIR, suffix="
                 "Train it with experiments/train_encoder.py (--head spatial_softmax), "
                 "or pass --untrained to check the plumbing.") from None
 
+    if predictor_name is None:
+        res = f"predictor_residual{suffix}.pt"
+        predictor_name = res if os.path.exists(os.path.join(checkpoint_dir, res)) else f"predictor{suffix}.pt"
+    pred_path = os.path.join(checkpoint_dir, predictor_name)
+    try:
+        predictor = load_predictor(pred_path, device, LATENT_DIM, ACTION_DIM, 128)
+    except (FileNotFoundError, RuntimeError) as e:
+        raise SystemExit(f"Could not load predictor {pred_path}:\n  {e}") from None
+
+    if predictor.residual:
+        sidecar = pred_path.replace(".pt", ".json")
+        enc_file = json.load(open(sidecar))["encoder_file"] if os.path.exists(sidecar) \
+            else f"target_encoder{suffix}.pt"
+        enc = make_spatial_encoder(device)
+        load(enc, enc_file)
+        print(f"Loaded residual predictor {predictor_name} + its frozen encoder {enc_file} "
+              f"from {checkpoint_dir}")
+        return enc.eval(), enc.eval(), predictor
+
     load(encoder, f"encoder{suffix}.pt")
-    load(predictor, f"predictor{suffix}.pt")
     target_name = f"target_encoder{suffix}.pt"
     if os.path.exists(os.path.join(checkpoint_dir, target_name)):
         goal_encoder = make_spatial_encoder(device)
         load(goal_encoder, target_name)
-        print(f"Loaded encoder, target_encoder, predictor ({suffix}) from {checkpoint_dir}")
+        print(f"Loaded encoder, target_encoder, {predictor_name} from {checkpoint_dir}")
     else:
         goal_encoder = encoder
         print(f"WARNING: {target_name} not found (checkpoint predates target-encoder saving). "
@@ -394,7 +417,8 @@ def run_test(args):
     random.seed(args.seed)
 
     encoder, goal_encoder, predictor = load_models(
-        device, untrained=args.untrained, checkpoint_dir=args.checkpoint_dir, suffix=args.suffix)
+        device, untrained=args.untrained, checkpoint_dir=args.checkpoint_dir, suffix=args.suffix,
+        predictor_name=args.predictor)
     env = SimEnv()
     background = load_background(env, args.background)
 
@@ -483,6 +507,9 @@ if __name__ == "__main__":
     parser.add_argument("--calib-scenes", type=int, default=400)
     parser.add_argument("--checkpoint-dir", default=CHECKPOINT_DIR)
     parser.add_argument("--suffix", default="_best", help="checkpoint suffix: _best, '' (final), _epoch10, ...")
+    parser.add_argument("--predictor", default=None,
+                        help="predictor file in --checkpoint-dir (default: predictor_residual{suffix}.pt "
+                             "if present, else predictor{suffix}.pt)")
     parser.add_argument("--background", default=BACKGROUND_PATH,
                         help="training background image (frames_background.npy next to the frame cache)")
     parser.add_argument("--seed", type=int, default=0)

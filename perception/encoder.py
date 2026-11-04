@@ -116,10 +116,19 @@ class VisualEncoder(nn.Module):
 
 
 class LatentPredictor(nn.Module):
-    """MLP: (latent, action) -> predicted next latent. 3 layers, LayerNorm + Mish."""
+    """MLP: (latent, action) -> predicted next latent. 3 layers, LayerNorm + Mish.
 
-    def __init__(self, latent_dim: int = 64, action_dim: int = 4, hidden_dim: int = 128):
+    residual=False: outputs z_{t+1} directly (original; has to re-learn the identity).
+    residual=True:  outputs z_t + f(z_t, a_t). The last layer is zero-initialized, so an
+        untrained residual predictor is exactly "nothing changes" and training only has to
+        learn the motion. The flag is stored as a buffer, so load_predictor() can rebuild
+        the right variant from a checkpoint.
+    """
+
+    def __init__(self, latent_dim: int = 64, action_dim: int = 4, hidden_dim: int = 128,
+                 residual: bool = False):
         super().__init__()
+        self.residual = residual
         self.net = nn.Sequential(
             nn.Linear(latent_dim + action_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -129,7 +138,20 @@ class LatentPredictor(nn.Module):
             nn.Mish(),
             nn.Linear(hidden_dim, latent_dim),
         )
+        if residual:
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+            self.register_buffer("residual_flag", torch.tensor(1))
 
     def forward(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([z, action], dim=-1)
-        return self.net(x)
+        out = self.net(torch.cat([z, action], dim=-1))
+        return z + out if self.residual else out
+
+
+def load_predictor(path: str, device="cpu", latent_dim: int = 64, action_dim: int = 4,
+                   hidden_dim: int = 128) -> LatentPredictor:
+    """Load a LatentPredictor checkpoint, detecting residual vs. direct from its contents."""
+    state = torch.load(path, map_location=device)
+    model = LatentPredictor(latent_dim, action_dim, hidden_dim, residual="residual_flag" in state)
+    model.load_state_dict(state)
+    return model.to(device).eval()

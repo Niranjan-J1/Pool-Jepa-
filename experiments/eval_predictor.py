@@ -24,7 +24,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 import train_encoder as te
-from perception.encoder import LatentPredictor
+from perception.encoder import load_predictor
 
 
 def main():
@@ -65,8 +65,7 @@ def main():
 
     in_ch = 3 * te.N_FRAMES
     encoder = load(te.make_encoder(in_ch), f"encoder{args.suffix}.pt")
-    predictor = load(LatentPredictor(latent_dim=te.LATENT_DIM, action_dim=4, hidden_dim=128).to(dev),
-                     f"predictor{args.suffix}.pt")
+    predictor = load_predictor(os.path.join(args.checkpoint_dir, f"predictor{args.suffix}.pt"), dev)
     spaces = {"online": encoder}
     tpath = f"target_encoder{args.suffix}.pt"
     if os.path.exists(os.path.join(args.checkpoint_dir, tpath)):
