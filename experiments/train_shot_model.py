@@ -4,7 +4,13 @@
     python experiments/train_shot_model.py
 
 Each shot is encoded once (file by file, so memory stays ~1 GB): z_pre from the two frames
-before the strike, z_rest from the settled frame. The model learns z_rest from (z_pre, force).
+before the strike, z_rest from the settled frame. The model learns z_rest from (z_pre, robot
+heading, force); --no-heading drops the heading (the latent alone encodes it poorly). The
+heading is the true pre-strike robot heading here; on hardware it comes from the marker tracker.
+
+Train on gentle shots: above force ~0.3 the cue ball bounces off several cushions and the
+outcome is unpredictable even from ground-truth state. Collect with
+    python data/collect.py --mode shot_pairs --episodes 5000 --force-range 0.05 0.3
 
 Held-out report (in physical units, via the cue-ball keypoint readout the planner uses):
   * cue rest position error (cm): model vs "cue doesn't move" vs the encoder ceiling
@@ -51,6 +57,7 @@ def parse_args():
     p.add_argument("--patience", type=int, default=30)
     p.add_argument("--holdout-fraction", type=float, default=0.1)
     p.add_argument("--calib-scenes", type=int, default=400)
+    p.add_argument("--no-heading", action="store_true", help="latent + force only (ablation)")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -97,7 +104,7 @@ def main():
 
     # Encode file by file.
     t0 = time.time()
-    z_pre, z_rest, force, cue_pre, cue_post, connected = [], [], [], [], [], []
+    z_pre, z_rest, force, cue_pre, cue_post, connected, heading = [], [], [], [], [], [], []
     for f in files:
         d = np.load(f)
         z_pre.append(encode_pairs(encoder, d["frame_pre_prev"], d["frame_pre"], background))
@@ -106,9 +113,12 @@ def main():
         cue_pre.append(d["ball_positions_pre"][:, 0])
         cue_post.append(d["ball_positions_post"][:, 0])
         connected.append(d["strike_connected"])
+        heading.append(d["robot_pose_pre"][:, 2])
         print(f"  encoded {os.path.basename(f)}", flush=True)
     z_pre, z_rest = torch.cat(z_pre), torch.cat(z_rest)
     force = torch.from_numpy(np.concatenate(force)).float()
+    heading = torch.from_numpy(np.concatenate(heading)).float()
+    use_heading = not args.no_heading
     cue_pre, cue_post = np.concatenate(cue_pre), np.concatenate(cue_post)
     connected = np.concatenate(connected)
     n = len(force)
@@ -118,13 +128,14 @@ def main():
     n_ho = max(1, int(n * args.holdout_fraction))
     ho, tr = perm[:n_ho], perm[n_ho:]
 
-    model = ShotModel(z_pre.shape[1]).to(DEVICE)
+    model = ShotModel(z_pre.shape[1], use_heading=use_heading).to(DEVICE)
+    print(f"Shot model inputs: latent{' + heading' if use_heading else ''} + force")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-    Zp, Zr, F = z_pre.to(DEVICE), z_rest.to(DEVICE), force.to(DEVICE)
+    Zp, Zr, F, Hd = z_pre.to(DEVICE), z_rest.to(DEVICE), force.to(DEVICE), heading.to(DEVICE)
     tr_t, ho_t = torch.from_numpy(tr).to(DEVICE), torch.from_numpy(ho).to(DEVICE)
 
     def loss_on(idx):
-        return nn.functional.mse_loss(model(Zp[idx], F[idx]), Zr[idx])
+        return nn.functional.mse_loss(model(Zp[idx], F[idx], Hd[idx]), Zr[idx])
 
     best, best_state, patience = float("inf"), None, 0
     for epoch in range(1, args.epochs + 1):
@@ -153,7 +164,8 @@ def main():
 
     out = os.path.join(args.checkpoint_dir, f"shot_model{args.suffix}.pt")
     save_shot_model(model, out, {"encoder_file": enc_file, "data": files, "n_shots": n,
-                                 "force_range": [float(force.min()), float(force.max())]})
+                                 "force_range": [float(force.min()), float(force.max())],
+                                 "use_heading": use_heading})
     print(f"Saved {out}\n")
 
     # ---- Evaluation in physical units via the cue-ball keypoints ----
@@ -164,10 +176,11 @@ def main():
     print(f"{kp.selected.sum()} cue keypoints, readout R^2 {kp.readout_r2:.3f}\n")
 
     with torch.no_grad():
-        zp_h, zr_h, f_h = z_pre[ho], z_rest[ho], force[ho]
-        pred = model(zp_h, f_h)
-        lo = model(zp_h, torch.full_like(f_h, 0.2))
-        hi = model(zp_h, torch.full_like(f_h, 0.9))
+        zp_h, zr_h, f_h, h_h = z_pre[ho], z_rest[ho], force[ho], heading[ho]
+        pred = model(zp_h, f_h, h_h)
+        f_lo, f_hi = float(force.min()), float(force.max())
+        lo = model(zp_h, torch.full_like(f_h, f_lo + 0.2 * (f_hi - f_lo)), h_h)
+        hi = model(zp_h, torch.full_like(f_h, f_lo + 0.9 * (f_hi - f_lo)), h_h)
     true_rest, true_start = cue_post[ho], cue_pre[ho]
     dec_pred = kp.decode_cue_batch(pred)
     dec_true_rest = kp.decode_cue_batch(zr_h)
@@ -191,8 +204,9 @@ def main():
     print(f"  -> model is {err_none.mean() / err_model.mean():.2f}x better than no-change")
     print(f"Cue travel: true mean {travel_true.mean():.1f} cm, predicted mean {travel_pred.mean():.1f} cm, "
           f"correlation r = {r:.2f}")
-    print(f"Force sensitivity (same start): predicted travel at force 0.2 = {d_lo.mean():.1f} cm, "
-          f"at 0.9 = {d_hi.mean():.1f} cm "
+    print(f"Force sensitivity (same start): predicted travel at force "
+          f"{f_lo + 0.2 * (f_hi - f_lo):.2f} = {d_lo.mean():.1f} cm, "
+          f"at {f_lo + 0.9 * (f_hi - f_lo):.2f} = {d_hi.mean():.1f} cm "
           f"({100 * (d_hi > d_lo).mean():.0f}% of starts predict a harder shot goes further)")
 
 

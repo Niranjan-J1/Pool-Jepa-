@@ -41,10 +41,14 @@ class ShotPlanner:
         self.forces = (force_grid() if forces is None else forces).to(device)
 
     @torch.no_grad()
-    def plan(self, z_pre: torch.Tensor, target_xy):
-        """z_pre: (D,) latent before the strike. Returns (force, info)."""
+    def plan(self, z_pre: torch.Tensor, target_xy, heading: float | None = None):
+        """z_pre: (D,) latent before the strike; heading: robot heading in radians (from the
+        marker tracker on hardware, the sim pose here), required by heading shot models.
+        Returns (force, info)."""
         z = z_pre.to(self.device).flatten().unsqueeze(0).expand(len(self.forces), -1)
-        rest = self.kp.decode_cue_batch(self.model(z, self.forces))  # (F, 2) m
+        h = None if heading is None else torch.full((len(self.forces),), float(heading), device=self.device)
+        rest = self.kp.decode_cue_batch(self.model(z, self.forces, h))  # (F, 2) m
+        # Note: model(...) with h=None is fine for heading-free models only.
         cost = np.linalg.norm(rest - np.asarray(target_xy)[None], axis=1)
         i = int(cost.argmin())
         return float(self.forces[i]), {"predicted_rest": rest[i], "predicted_miss": float(cost[i]),
@@ -60,12 +64,12 @@ IDLE = dict(left_pwm=0.0, right_pwm=0.0, fire=False, fire_force=0.0)
 
 def replay_shot(env, scene_state, force, render_pre=False):
     """Recreate the scene from a saved `random` state, fire with `force`, let it settle.
-    Returns (cue rest position, (prev_frame, pre_frame) if render_pre)."""
+    Returns (cue rest position, (prev_frame, pre_frame, heading) if render_pre)."""
     random.setstate(scene_state)
     obs = env.reset(setup="behind_cue")
     f_prev = obs["frame"] if render_pre else None
     obs = env.step(IDLE, render=render_pre)
-    frames = (f_prev, obs["frame"]) if render_pre else None
+    frames = (f_prev, obs["frame"], obs["robot_pose"][2]) if render_pre else None
     env.step(dict(left_pwm=0.0, right_pwm=0.0, fire=True, fire_force=force), render=False)
     post, _ = env.settle()
     return np.array(post["ball_positions"][0]), frames
@@ -81,7 +85,8 @@ def run_test(args):
     encoder = cem.make_spatial_encoder(device)
     encoder.load_state_dict(torch.load(os.path.join(args.checkpoint_dir, enc_file), map_location=device))
     encoder.eval()
-    print(f"Loaded {os.path.basename(shot_path)} with its frozen encoder {enc_file}")
+    print(f"Loaded {os.path.basename(shot_path)} with its frozen encoder {enc_file} "
+          f"(heading input: {'yes' if shot_model.use_heading else 'no'})")
 
     env = SimEnv()
     background = cem.load_background(env, args.background)
@@ -101,10 +106,11 @@ def run_test(args):
         scene = random.getstate()
         f_star = float(rng.uniform(f_lo, f_hi))
         target, _ = replay_shot(env, scene, f_star)
-        start, (f_prev, f_pre) = replay_shot(env, scene, f_star, render_pre=True)  # same scene, frames
+        start, (f_prev, f_pre, heading) = replay_shot(env, scene, f_star, render_pre=True)  # same scene
         z_pre = cem.encode(encoder, f_prev, f_pre, background, device)
 
-        f_plan, info = planner.plan(z_pre, target)
+        # Heading stands in for the hardware marker tracker; heading-free models ignore it.
+        f_plan, info = planner.plan(z_pre, target, heading if shot_model.use_heading else None)
         for name, f in (("planner", f_plan), (f"fixed {f_mid}", f_mid),
                         ("random force", float(rng.uniform(f_lo, f_hi)))):
             rest, _ = replay_shot(env, scene, f)
