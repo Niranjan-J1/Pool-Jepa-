@@ -5,8 +5,11 @@ latent predictor forward, and keeps refining a Gaussian over sequences toward th
 ones whose imagined final latent lands closest to a goal latent.
 
 World-model interface (so a 5-model ensemble can replace the single predictor):
-    model.predict(z, a) -> z_next     z: (N, D), a: (N, 4), returns (N, D)
-    model.uncertainty(z, a) -> (N,)   optional; ensembles return member disagreement
+    model.predict(z, a, z_prev) -> z_next    z, z_prev: (N, D), a: (N, 4), returns (N, D)
+    model.uncertainty(z, a, z_prev) -> (N,)  optional; ensembles return member disagreement
+z_prev is the previous latent; velocity predictors use z - z_prev, others ignore it.
+During a rollout the planner carries (z_prev, z) forward, starting from the real
+previous and current latents.
 `SinglePredictor` wraps one LatentPredictor; `EnsemblePredictor` wraps several and
 returns their mean, plus disagreement the cost can penalize (UNCERTAINTY_WEIGHT).
 
@@ -53,11 +56,11 @@ class SinglePredictor:
         self.predictor = predictor.eval()
 
     @torch.no_grad()
-    def predict(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        return self.predictor(z, a)
+    def predict(self, z: torch.Tensor, a: torch.Tensor, z_prev: torch.Tensor | None = None) -> torch.Tensor:
+        return self.predictor(z, a, z_prev)
 
     @torch.no_grad()
-    def uncertainty(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    def uncertainty(self, z: torch.Tensor, a: torch.Tensor, z_prev: torch.Tensor | None = None) -> torch.Tensor:
         return torch.zeros(z.shape[0], device=z.device)
 
 
@@ -73,16 +76,16 @@ class EnsemblePredictor:
         self.predictors = [p.eval() for p in predictors]
 
     @torch.no_grad()
-    def _all(self, z, a):
-        return torch.stack([p(z, a) for p in self.predictors])  # (E, N, D)
+    def _all(self, z, a, z_prev=None):
+        return torch.stack([p(z, a, z_prev) for p in self.predictors])  # (E, N, D)
 
     @torch.no_grad()
-    def predict(self, z, a):
-        return self._all(z, a).mean(0)
+    def predict(self, z, a, z_prev=None):
+        return self._all(z, a, z_prev).mean(0)
 
     @torch.no_grad()
-    def uncertainty(self, z, a):
-        return self._all(z, a).std(0).mean(-1)
+    def uncertainty(self, z, a, z_prev=None):
+        return self._all(z, a, z_prev).std(0).mean(-1)
 
 
 # --------------------------------------------------------------------------------------
@@ -111,7 +114,8 @@ def to_executable(actions: torch.Tensor) -> torch.Tensor:
 class CEMPlanner:
     """Plans action sequences by CEM through a latent world model.
 
-    plan(z0, z_goal) -> (best first action (4,), info dict)
+    plan(z0, z_goal, z_prev=None) -> (best first action (4,), info dict)
+    z_prev is the latent one step before z0 (needed by velocity predictors; None = at rest).
 
     Cost of a sequence = || z_H - z_goal ||_w  (+ uncertainty_weight * summed disagreement),
     where w are optional per-latent-dim weights (e.g. to ignore robot keypoints and
@@ -134,17 +138,18 @@ class CEMPlanner:
         self._warm_mean = None
 
     @torch.no_grad()
-    def rollout(self, z0: torch.Tensor, actions: torch.Tensor):
-        """Batched imagination. z0: (D,), actions: (N, H, 4) executable.
+    def rollout(self, z0: torch.Tensor, actions: torch.Tensor, z_prev0: torch.Tensor | None = None):
+        """Batched imagination. z0, z_prev0: (D,), actions: (N, H, 4) executable.
         Returns final latents (N, D), per-step latents (N, H, D), summed uncertainty (N,)."""
         n, h, _ = actions.shape
         z = z0.unsqueeze(0).expand(n, -1)
+        z_prev = z if z_prev0 is None else z_prev0.unsqueeze(0).expand(n, -1)
         traj, unc = [], torch.zeros(n, device=self.device)
         for t in range(h):  # loop over time only; all N candidates step together
             a_t = actions[:, t]
             if self.cfg.uncertainty_weight > 0:
-                unc = unc + self.model.uncertainty(z, a_t)
-            z = self.model.predict(z, a_t)
+                unc = unc + self.model.uncertainty(z, a_t, z_prev)
+            z_prev, z = z, self.model.predict(z, a_t, z_prev)
             traj.append(z)
         return z, torch.stack(traj, 1), unc
 
@@ -155,9 +160,10 @@ class CEMPlanner:
         return diff.norm(dim=-1) + self.cfg.uncertainty_weight * unc
 
     @torch.no_grad()
-    def plan(self, z0: torch.Tensor, z_goal: torch.Tensor):
+    def plan(self, z0: torch.Tensor, z_goal: torch.Tensor, z_prev: torch.Tensor | None = None):
         cfg, dev = self.cfg, self.device
         z0, z_goal = z0.to(dev).flatten(), z_goal.to(dev).flatten()
+        z_prev = None if z_prev is None else z_prev.to(dev).flatten()
         low, high = ACTION_LOW.to(dev), ACTION_HIGH.to(dev)
 
         mean = torch.zeros(cfg.horizon, ACTION_DIM, device=dev)
@@ -176,7 +182,7 @@ class CEMPlanner:
                 raw[0] = mean  # keep the previous plan as a candidate
             actions = to_executable(raw)
 
-            z_final, _, unc = self.rollout(z0, actions)
+            z_final, _, unc = self.rollout(z0, actions, z_prev)
             costs = self.cost(z_final, z_goal, unc)
 
             elite_costs, elite_idx = costs.topk(cfg.num_elites, largest=False)
@@ -193,7 +199,7 @@ class CEMPlanner:
         # Warm start for the next call: drop the executed step, repeat the last one.
         self._warm_mean = torch.cat([mean[1:], mean[-1:]], 0)
 
-        z_pred_final, z_traj, _ = self.rollout(z0, best_seq.unsqueeze(0))
+        z_pred_final, z_traj, _ = self.rollout(z0, best_seq.unsqueeze(0), z_prev)
         info = {"best_sequence": best_seq.cpu(), "best_cost": best_cost, "history": history,
                 "predicted_next_latent": z_traj[0, 0].cpu(),
                 "predicted_final_latent": z_pred_final[0].cpu()}
@@ -330,6 +336,11 @@ class CueKeypoints:
         zs = z.detach().cpu().numpy().reshape(-1, 2)[self.selected].reshape(-1)
         return np.append(zs, 1.0) @ self.readout
 
+    def decode_cue_batch(self, z: torch.Tensor) -> np.ndarray:
+        """Cue positions (N, 2) in m from latents (N, D)."""
+        zs = z.detach().cpu().numpy().reshape(len(z), -1, 2)[:, self.selected].reshape(len(z), -1)
+        return np.concatenate([zs, np.ones((len(z), 1))], 1) @ self.readout
+
 
 def _affine_r2(X, Y):
     """Least-squares fit Y ~ [X, 1] @ A; returns (A, R^2)."""
@@ -350,8 +361,11 @@ def calibrate_cue_keypoints(goal_encoder, env, background, device, n_scenes=400,
     positions are correlated; teleporting the cue ball to a uniform random spot breaks that,
     so a robot-tracking keypoint can't pass as a cue keypoint.
     """
+    import random
     from env.sim_env import BALL_RADIUS, CUSHION_THICKNESS, TABLE_LENGTH, TABLE_WIDTH
     rng = np.random.default_rng(seed)
+    py_state = random.getstate()
+    random.seed(seed)  # env.reset() draws from `random`; seed it so keypoint selection is reproducible
     lim = np.array([TABLE_LENGTH / 2, TABLE_WIDTH / 2]) - CUSHION_THICKNESS - BALL_RADIUS - 0.005
     Z, cue, robot = [], [], []
     while len(Z) < n_scenes:
@@ -364,6 +378,7 @@ def calibrate_cue_keypoints(goal_encoder, env, background, device, n_scenes=400,
         Z.append(encode(goal_encoder, frame, frame, background, device).cpu().numpy())
         cue.append(p)
         robot.append((rx, ry))
+    random.setstate(py_state)  # leave the caller's random stream untouched
     Z, cue, robot = np.array(Z), np.array(cue), np.array(robot)
     kps = Z.reshape(len(Z), -1, 2)
     n_kp = kps.shape[1]
@@ -436,8 +451,11 @@ def run_test(args):
     if not cue_kp.selected.any():
         raise SystemExit("No keypoint tracks the cue ball; the planner has nothing to aim at.")
 
-    # 2. Scene: robot behind the cue ball; one no-op step gives the encoder its previous frame.
+    # 2. Scene: robot behind the cue ball. Two no-op steps give three frames: the encoder needs
+    #    (prev, cur) for z_t, and velocity predictors also need z_{t-1} from (prev2, prev).
     obs = env.reset(setup="behind_cue")
+    prev2 = obs["frame"]
+    obs = env.step(dict(left_pwm=0.0, right_pwm=0.0, fire=False, fire_force=0.0))
     prev = obs["frame"]
     obs = env.step(dict(left_pwm=0.0, right_pwm=0.0, fire=False, fire_force=0.0))
     cur = obs["frame"]
@@ -465,11 +483,12 @@ def run_test(args):
 
     for step in range(args.mpc_steps):
         z_t = encode(encoder, prev, cur, background, device)          # predictor input space
-        action, info = planner.plan(z_t, z_goal)
+        z_prev = encode(encoder, prev2, prev, background, device)     # one step earlier
+        action, info = planner.plan(z_t, z_goal, z_prev)
         act = dict(left_pwm=float(action[0]), right_pwm=float(action[1]),
                    fire=bool(action[2] > 0.5), fire_force=float(action[3]))
 
-        prev = cur
+        prev2, prev = prev, cur
         obs = env.step(act)
         cur = obs["frame"]
         z_actual = encode(goal_encoder, prev, cur, background, device)  # predictor output space

@@ -119,18 +119,24 @@ class LatentPredictor(nn.Module):
     """MLP: (latent, action) -> predicted next latent. 3 layers, LayerNorm + Mish.
 
     residual=False: outputs z_{t+1} directly (original; has to re-learn the identity).
-    residual=True:  outputs z_t + f(z_t, a_t). The last layer is zero-initialized, so an
+    residual=True:  outputs z_t + f(...). The last layer is zero-initialized, so an
         untrained residual predictor is exactly "nothing changes" and training only has to
-        learn the motion. The flag is stored as a buffer, so load_predictor() can rebuild
-        the right variant from a checkpoint.
+        learn the motion.
+    use_velocity=True: the input also includes the latent velocity z_t - z_{t-1}
+        (forward(z, action, z_prev)), the latent version of the finite-difference velocity
+        that made the ground-truth dynamics probe work. Without it, a latent that barely
+        encodes velocity can't tell a rolling ball from a still one.
+    Both flags are stored as buffers, so load_predictor() rebuilds the right variant.
     """
 
     def __init__(self, latent_dim: int = 64, action_dim: int = 4, hidden_dim: int = 128,
-                 residual: bool = False):
+                 residual: bool = False, use_velocity: bool = False):
         super().__init__()
         self.residual = residual
+        self.use_velocity = use_velocity
+        in_dim = latent_dim * (2 if use_velocity else 1) + action_dim
         self.net = nn.Sequential(
-            nn.Linear(latent_dim + action_dim, hidden_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.Mish(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -142,16 +148,25 @@ class LatentPredictor(nn.Module):
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
             self.register_buffer("residual_flag", torch.tensor(1))
+        if use_velocity:
+            self.register_buffer("velocity_flag", torch.tensor(1))
 
-    def forward(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        out = self.net(torch.cat([z, action], dim=-1))
+    def forward(self, z: torch.Tensor, action: torch.Tensor,
+                z_prev: torch.Tensor | None = None) -> torch.Tensor:
+        """z_prev is the previous latent z_{t-1}; ignored unless use_velocity. If it is
+        missing for a velocity model, velocity is taken as zero (first step of an episode)."""
+        parts = [z]
+        if self.use_velocity:
+            parts.append(torch.zeros_like(z) if z_prev is None else z - z_prev)
+        out = self.net(torch.cat(parts + [action], dim=-1))
         return z + out if self.residual else out
 
 
 def load_predictor(path: str, device="cpu", latent_dim: int = 64, action_dim: int = 4,
                    hidden_dim: int = 128) -> LatentPredictor:
-    """Load a LatentPredictor checkpoint, detecting residual vs. direct from its contents."""
+    """Load a LatentPredictor checkpoint, detecting residual / velocity variants from its contents."""
     state = torch.load(path, map_location=device)
-    model = LatentPredictor(latent_dim, action_dim, hidden_dim, residual="residual_flag" in state)
+    model = LatentPredictor(latent_dim, action_dim, hidden_dim, residual="residual_flag" in state,
+                            use_velocity="velocity_flag" in state)
     model.load_state_dict(state)
     return model.to(device).eval()
