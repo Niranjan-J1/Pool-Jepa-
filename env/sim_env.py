@@ -32,6 +32,11 @@ CUSHION_ELASTICITY = 0.7
 CUSHION_FRICTION = 0.3
 LINEAR_DAMPING = 0.97
 ANGULAR_DAMPING = 0.95
+# Rolling resistance of the cloth: constant deceleration on every moving ball. Without it
+# (damping alone keeps 97% of speed per second) balls never come to rest. With 0.5 m/s^2,
+# behind_cue strikes settle in ~1-2 s (median 70 steps, cushions absorb energy too) and the
+# cue ball travels 1-56 cm (median 16 cm).
+ROLLING_DECEL = 0.5  # m/s^2
 
 # Solenoid
 MAX_STRIKE_IMPULSE = 0.05
@@ -222,7 +227,9 @@ class SimEnv(BaseEnv):
             return pos, heading, balls
         raise RuntimeError("Could not sample a valid behind_cue setup")
 
-    def step(self, action: Action) -> Observation:
+    def step(self, action: Action, render: bool = True) -> Observation:
+        """Advance one control step (DT). render=False skips drawing the frame (obs["frame"]
+        is None), for fast physics-only rollouts such as letting a shot settle."""
         left_pwm = max(-1.0, min(1.0, action["left_pwm"]))
         right_pwm = max(-1.0, min(1.0, action["right_pwm"]))
 
@@ -255,13 +262,31 @@ class SimEnv(BaseEnv):
         else:
             self.last_strike_connected = False
 
+        sub_dt = DT / SUBSTEPS
         for _ in range(SUBSTEPS):
-            self._space.step(DT / SUBSTEPS)
+            self._space.step(sub_dt)
+            self._apply_rolling_resistance(sub_dt)
 
         for body in self._ball_bodies.values():
             body.angular_velocity *= ANGULAR_DAMPING
 
-        return self._get_observation()
+        return self._get_observation(render)
+
+    def _apply_rolling_resistance(self, dt: float):
+        dv = ROLLING_DECEL * dt
+        for body in self._ball_bodies.values():
+            speed = body.velocity.length
+            body.velocity = (0.0, 0.0) if speed <= dv else body.velocity * (1.0 - dv / speed)
+
+    def settle(self, max_steps: int = 600) -> tuple[Observation, int]:
+        """Step with the robot idle (no rendering) until all balls stop or max_steps pass.
+        Returns the final observation (rendered) and the number of steps taken."""
+        idle = Action(left_pwm=0.0, right_pwm=0.0, fire=False, fire_force=0.0)
+        for n in range(1, max_steps + 1):
+            self.step(idle, render=False)
+            if self._balls_settled():
+                break
+        return self._get_observation(), n
 
     def _balls_settled(self) -> bool:
         for body in self._ball_bodies.values():
@@ -270,14 +295,14 @@ class SimEnv(BaseEnv):
                 return False
         return True
 
-    def _get_observation(self) -> Observation:
+    def _get_observation(self, render: bool = True) -> Observation:
         rb = self._robot_body
         ball_positions = [
             (float(b.position.x), float(b.position.y))
             for b in self._ball_bodies.values()
         ]
         return Observation(
-            frame=self.render(),
+            frame=self.render() if render else None,
             robot_pose=(float(rb.position.x), float(rb.position.y), float(rb.angle)),
             ball_positions=ball_positions,
             ball_settled=self._balls_settled(),

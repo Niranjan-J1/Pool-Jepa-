@@ -230,7 +230,8 @@ def encode(encoder, prev_frame, cur_frame, background, device) -> torch.Tensor:
 
 REPO = os.path.join(os.path.dirname(__file__), "..")
 CHECKPOINT_DIR = os.path.join(REPO, "data", "checkpoints")
-BACKGROUND_PATH = os.path.join(REPO, "data", "datasets", "frames_background.npy")
+BACKGROUND_PATH = os.path.join(os.environ.get("POOLJEPA_DATA", os.path.join(REPO, "data", "datasets")),
+                               "frames_background.npy")
 LATENT_DIM = 64
 
 
