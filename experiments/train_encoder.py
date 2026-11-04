@@ -321,12 +321,19 @@ def linear_probe(encoder, frames, meta, train_rows, hold_rows):
     return r2
 
 
-def save_checkpoint(encoder, predictor, suffix=""):
+def save_checkpoint(encoder, predictor, target_encoder, suffix=""):
+    """Save online encoder, predictor, and the EMA target encoder.
+
+    The predictor is trained to output TARGET-encoder latents (z_{t+1} = target(x_{t+1})),
+    so anything that compares predictions to encoded frames (planning goals, eval)
+    must encode those frames with target_encoder*.pt, not encoder*.pt.
+    """
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     enc_path = os.path.join(CHECKPOINT_DIR, f"encoder{suffix}.pt")
     pred_path = os.path.join(CHECKPOINT_DIR, f"predictor{suffix}.pt")
     torch.save(encoder.state_dict(), enc_path)
     torch.save(predictor.state_dict(), pred_path)
+    torch.save(target_encoder.state_dict(), os.path.join(CHECKPOINT_DIR, f"target_encoder{suffix}.pt"))
     return enc_path, pred_path
 
 
@@ -439,13 +446,13 @@ def train():
               f"[{collapsed}]  ({elapsed:.1f}s)", flush=True)
 
         if epoch % SAVE_EVERY == 0:
-            enc_path, _ = save_checkpoint(encoder, predictor, f"_epoch{epoch}")
+            enc_path, _ = save_checkpoint(encoder, predictor, target_encoder, f"_epoch{epoch}")
             print(f"  -> Checkpoint saved: {enc_path}")
 
         if holdout_loss < best_loss - EARLY_STOP_MIN_DELTA:
             best_loss = holdout_loss
             patience_counter = 0
-            save_checkpoint(encoder, predictor, "_best")
+            save_checkpoint(encoder, predictor, target_encoder, "_best")
         else:
             patience_counter += 1
 
@@ -453,7 +460,7 @@ def train():
             print(f"\nEarly stopping at epoch {epoch} (no holdout improvement for {EARLY_STOP_PATIENCE} epochs)")
             break
 
-    enc_path, pred_path = save_checkpoint(encoder, predictor)
+    enc_path, pred_path = save_checkpoint(encoder, predictor, target_encoder)
     print(f"\nSaved final encoder to {enc_path}")
     print(f"Saved final predictor to {pred_path}")
 

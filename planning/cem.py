@@ -20,6 +20,7 @@ Run the test (needs the trained spatial-softmax encoder + predictor in data/chec
     python planning/cem.py
     python planning/cem.py --mpc-steps 10 --horizon 5
     python planning/cem.py --untrained   # random weights: checks the plumbing only
+    python planning/cem.py --checkpoint-dir path/to/ckpts --suffix ""   # final instead of best
 """
 import argparse
 import math
@@ -226,33 +227,146 @@ BACKGROUND_PATH = os.path.join(REPO, "data", "datasets", "frames_background.npy"
 LATENT_DIM = 64
 
 
-def load_models(device, untrained=False, encoder_ckpt="encoder_best.pt",
-                predictor_ckpt="predictor_best.pt"):
+def make_spatial_encoder(device):
     from env.sim_env import RENDER_HEIGHT, RENDER_WIDTH
-    encoder = VisualEncoder(latent_dim=LATENT_DIM, in_channels=6, use_simnorm=False,
-                            input_hw=(RENDER_HEIGHT, RENDER_WIDTH), head="spatial_softmax").to(device)
+    return VisualEncoder(latent_dim=LATENT_DIM, in_channels=6, use_simnorm=False,
+                         input_hw=(RENDER_HEIGHT, RENDER_WIDTH), head="spatial_softmax").to(device)
+
+
+def load_models(device, untrained=False, checkpoint_dir=CHECKPOINT_DIR, suffix="_best"):
+    """Returns (encoder, goal_encoder, predictor).
+
+    encoder      = online encoder: produces z_t, the predictor's INPUT during training.
+    goal_encoder = EMA target encoder: the predictor was trained to OUTPUT its latents,
+                   so goals and "actual" next latents must be encoded with it.
+    Older checkpoints have no target encoder; the online one is used with a warning.
+    """
+    encoder = make_spatial_encoder(device)
     predictor = LatentPredictor(latent_dim=LATENT_DIM, action_dim=ACTION_DIM, hidden_dim=128).to(device)
     if untrained:
         print("WARNING: --untrained, using random weights (checks plumbing, not planning quality)")
+        return encoder.eval(), encoder.eval(), predictor.eval()
+
+    def load(module, name):
+        path = os.path.join(checkpoint_dir, name)
+        try:
+            module.load_state_dict(torch.load(path, map_location=device))
+        except (FileNotFoundError, RuntimeError) as e:
+            raise SystemExit(
+                f"Could not load {path} into the spatial-softmax architecture:\n  {e}\n"
+                "Train it with experiments/train_encoder.py (--head spatial_softmax), "
+                "or pass --untrained to check the plumbing.") from None
+
+    load(encoder, f"encoder{suffix}.pt")
+    load(predictor, f"predictor{suffix}.pt")
+    target_name = f"target_encoder{suffix}.pt"
+    if os.path.exists(os.path.join(checkpoint_dir, target_name)):
+        goal_encoder = make_spatial_encoder(device)
+        load(goal_encoder, target_name)
+        print(f"Loaded encoder, target_encoder, predictor ({suffix}) from {checkpoint_dir}")
     else:
-        for module, name in ((encoder, encoder_ckpt), (predictor, predictor_ckpt)):
-            path = os.path.join(CHECKPOINT_DIR, name)
-            try:
-                module.load_state_dict(torch.load(path, map_location=device))
-            except (FileNotFoundError, RuntimeError) as e:
-                raise SystemExit(
-                    f"Could not load {path} into the spatial-softmax architecture:\n  {e}\n"
-                    "Train it with experiments/train_encoder.py (--head spatial_softmax), "
-                    "or pass --untrained to check the plumbing.") from None
-        print(f"Loaded {encoder_ckpt} and {predictor_ckpt} from {CHECKPOINT_DIR}")
-    return encoder.eval(), predictor.eval()
+        goal_encoder = encoder
+        print(f"WARNING: {target_name} not found (checkpoint predates target-encoder saving). "
+              "Using the online encoder for goals; the predictor was trained against the EMA "
+              "target, so predicted-vs-actual errors are inflated. Retrain to fix.")
+    return encoder.eval(), goal_encoder.eval(), predictor.eval()
 
 
-def load_background(env, n=200):
+# --------------------------------------------------------------------------------------
+# Cue-ball keypoints: which latent dims track the cue ball, and goals in those dims
+# --------------------------------------------------------------------------------------
+
+@dataclass
+class CueKeypoints:
+    """Which spatial-softmax keypoints track the cue ball (not the robot), plus
+    per-keypoint affine maps cue (x, y) -> keypoint (x, y) for building goals and a
+    linear readout latent -> cue (x, y) for reporting predicted positions in meters."""
+    r2_cue: np.ndarray        # (K,) per-keypoint R^2 of cue position -> keypoint
+    r2_robot: np.ndarray      # (K,) same for robot position
+    selected: np.ndarray      # (K,) bool
+    affine: np.ndarray        # (K, 3, 2): [cue_x, cue_y, 1] @ affine[k] -> keypoint k (x, y)
+    readout: np.ndarray       # (2*K_sel + 1, 2): [selected dims, 1] @ readout -> cue (x, y)
+    readout_r2: float         # held-out R^2 of the readout on calibration scenes
+
+    @property
+    def dim_weights(self) -> np.ndarray:
+        """(2K,) cost weights: R^2_cue on both dims of each selected keypoint, 0 elsewhere."""
+        w = np.where(self.selected, self.r2_cue, 0.0)
+        return np.repeat(w, 2).astype(np.float32)
+
+    def goal_latent(self, cue_xy) -> torch.Tensor:
+        """Latent whose selected keypoints sit where they would for a cue ball at cue_xy.
+        Unselected dims are 0 and carry zero cost weight."""
+        x = np.array([cue_xy[0], cue_xy[1], 1.0])
+        kp = np.einsum("i,kij->kj", x, self.affine)          # (K, 2)
+        kp[~self.selected] = 0.0
+        return torch.from_numpy(kp.reshape(-1).astype(np.float32))
+
+    def decode_cue(self, z: torch.Tensor) -> np.ndarray:
+        """Linear readout of the cue position (m) from a latent (D,)."""
+        zs = z.detach().cpu().numpy().reshape(-1, 2)[self.selected].reshape(-1)
+        return np.append(zs, 1.0) @ self.readout
+
+
+def _affine_r2(X, Y):
+    """Least-squares fit Y ~ [X, 1] @ A; returns (A, R^2)."""
+    Xa = np.concatenate([X, np.ones((len(X), 1))], 1)
+    A, *_ = np.linalg.lstsq(Xa, Y, rcond=None)
+    ss_res = ((Xa @ A - Y) ** 2).sum()
+    ss_tot = ((Y - Y.mean(0)) ** 2).sum() + 1e-12
+    return A, 1.0 - ss_res / ss_tot
+
+
+@torch.no_grad()
+def calibrate_cue_keypoints(goal_encoder, env, background, device, n_scenes=400, min_r2=0.3,
+                            seed=0) -> CueKeypoints:
+    """Render scenes with the cue ball placed independently of the robot, encode them, and
+    find keypoints whose (x, y) follow the cue ball more than the robot.
+
+    In behind_cue episodes the cue ball starts right in front of the robot, so cue and robot
+    positions are correlated; teleporting the cue ball to a uniform random spot breaks that,
+    so a robot-tracking keypoint can't pass as a cue keypoint.
+    """
+    from env.sim_env import BALL_RADIUS, CUSHION_THICKNESS, TABLE_LENGTH, TABLE_WIDTH
+    rng = np.random.default_rng(seed)
+    lim = np.array([TABLE_LENGTH / 2, TABLE_WIDTH / 2]) - CUSHION_THICKNESS - BALL_RADIUS - 0.005
+    Z, cue, robot = [], [], []
+    while len(Z) < n_scenes:
+        obs = env.reset(setup="behind_cue")
+        rx, ry, th = obs["robot_pose"]
+        p = rng.uniform(-lim, lim)
+        if env._overlaps_robot(tuple(p), (rx, ry), th, BALL_RADIUS):
+            continue
+        frame = render_with_cue_at(env, tuple(p))
+        Z.append(encode(goal_encoder, frame, frame, background, device).cpu().numpy())
+        cue.append(p)
+        robot.append((rx, ry))
+    Z, cue, robot = np.array(Z), np.array(cue), np.array(robot)
+    kps = Z.reshape(len(Z), -1, 2)
+    n_kp = kps.shape[1]
+
+    r2_cue, r2_robot, affine = np.zeros(n_kp), np.zeros(n_kp), np.zeros((n_kp, 3, 2))
+    for k in range(n_kp):
+        affine[k], r2_cue[k] = _affine_r2(cue, kps[:, k])
+        _, r2_robot[k] = _affine_r2(robot, kps[:, k])
+    selected = (r2_cue >= min_r2) & (r2_cue > r2_robot)
+
+    readout, readout_r2 = np.zeros((1, 2)), float("nan")
+    if selected.any():
+        feats = kps[:, selected].reshape(len(Z), -1)
+        n_tr = int(0.8 * len(Z))
+        A, _ = _affine_r2(feats[:n_tr], cue[:n_tr])
+        pred = np.concatenate([feats[n_tr:], np.ones((len(Z) - n_tr, 1))], 1) @ A
+        readout_r2 = 1 - ((pred - cue[n_tr:]) ** 2).sum() / ((cue[n_tr:] - cue[:n_tr].mean(0)) ** 2).sum()
+        readout, _ = _affine_r2(feats, cue)  # refit on everything for use
+    return CueKeypoints(r2_cue, r2_robot, selected, affine, readout, float(readout_r2))
+
+
+def load_background(env, path=BACKGROUND_PATH, n=200):
     """Training-time background if available; otherwise a median over random scenes."""
-    if os.path.exists(BACKGROUND_PATH):
-        return np.load(BACKGROUND_PATH)
-    print(f"{BACKGROUND_PATH} not found; estimating background from {n} random scenes")
+    if os.path.exists(path):
+        return np.load(path)
+    print(f"{path} not found; estimating background from {n} random scenes")
     frames = []
     for _ in range(n):
         env.reset(setup="behind_cue")
@@ -279,29 +393,46 @@ def run_test(args):
     import random
     random.seed(args.seed)
 
-    encoder, predictor = load_models(device, untrained=args.untrained)
+    encoder, goal_encoder, predictor = load_models(
+        device, untrained=args.untrained, checkpoint_dir=args.checkpoint_dir, suffix=args.suffix)
     env = SimEnv()
-    background = load_background(env)
+    background = load_background(env, args.background)
 
-    # Scene: robot just behind the cue ball. One no-op step gives the previous frame
-    # the two-frame encoder needs.
+    # 1. Which keypoints track the cue ball? (goal-encoder space = predictor output space)
+    print(f"\nCalibrating cue keypoints on {args.calib_scenes} scenes (cue placed independently of robot)...")
+    cue_kp = calibrate_cue_keypoints(goal_encoder, env, background, device,
+                                     n_scenes=args.calib_scenes, seed=args.seed)
+    order = np.argsort(-cue_kp.r2_cue)
+    print(f"{cue_kp.selected.sum()} of {len(cue_kp.selected)} keypoints selected as cue-tracking "
+          f"(R^2_cue >= 0.3 and > R^2_robot). Top 8 by R^2_cue:")
+    print("  kp   R2_cue  R2_robot  selected")
+    for k in order[:8]:
+        print(f"  {k:2d}   {cue_kp.r2_cue[k]:6.3f}  {cue_kp.r2_robot[k]:8.3f}  {'yes' if cue_kp.selected[k] else 'no'}")
+    print(f"Cue-position readout from selected keypoints: held-out R^2 = {cue_kp.readout_r2:.3f}")
+    if not cue_kp.selected.any():
+        raise SystemExit("No keypoint tracks the cue ball; the planner has nothing to aim at.")
+
+    # 2. Scene: robot behind the cue ball; one no-op step gives the encoder its previous frame.
     obs = env.reset(setup="behind_cue")
     prev = obs["frame"]
     obs = env.step(dict(left_pwm=0.0, right_pwm=0.0, fire=False, fire_force=0.0))
     cur = obs["frame"]
 
-    # Goal: cue ball TARGET_DIST further along the robot's heading (a reachable shot),
-    # clipped to stay on the table.
+    # 3. Goal: a cue-ball POSITION, mapped into the cue keypoints only (robot dims weight 0).
     from env.sim_env import BALL_RADIUS, CUSHION_THICKNESS, TABLE_LENGTH, TABLE_WIDTH
     x, y, theta = obs["robot_pose"]
     cue0 = np.array(obs["ball_positions"][0])
     lim = np.array([TABLE_LENGTH / 2, TABLE_WIDTH / 2]) - CUSHION_THICKNESS - BALL_RADIUS - 0.01
     target = np.clip(cue0 + args.target_dist * np.array([math.cos(theta), math.sin(theta)]), -lim, lim)
-    goal_frame = render_with_cue_at(env, tuple(target))
-    z_goal = encode(encoder, goal_frame, goal_frame, background, device)  # stationary goal
+    z_goal = cue_kp.goal_latent(target).to(device)
 
     model = SinglePredictor(predictor)  # swap for EnsemblePredictor([...]) later
-    planner = CEMPlanner(model, CEMConfig(horizon=args.horizon), device=device, seed=args.seed)
+    planner = CEMPlanner(model, CEMConfig(horizon=args.horizon), device=device,
+                         dim_weights=cue_kp.dim_weights, seed=args.seed)
+    w = planner.dim_weights
+
+    def goal_dist(z):  # same weighted distance the planner minimizes
+        return float(((z.to(device) - z_goal) * w.sqrt()).norm())
 
     print(f"\nCue ball at ({cue0[0]:+.3f}, {cue0[1]:+.3f}) m -> target ({target[0]:+.3f}, {target[1]:+.3f}) m "
           f"[{100 * np.linalg.norm(target - cue0):.1f} cm away]")
@@ -309,7 +440,7 @@ def run_test(args):
           f"{planner.cfg.num_elites} elites, {planner.cfg.iterations} iterations, device {device}\n")
 
     for step in range(args.mpc_steps):
-        z_t = encode(encoder, prev, cur, background, device)
+        z_t = encode(encoder, prev, cur, background, device)          # predictor input space
         action, info = planner.plan(z_t, z_goal)
         act = dict(left_pwm=float(action[0]), right_pwm=float(action[1]),
                    fire=bool(action[2] > 0.5), fire_force=float(action[3]))
@@ -317,20 +448,23 @@ def run_test(args):
         prev = cur
         obs = env.step(act)
         cur = obs["frame"]
-        z_actual = encode(encoder, prev, cur, background, device)
+        z_actual = encode(goal_encoder, prev, cur, background, device)  # predictor output space
         z_pred = info["predicted_next_latent"].to(device)
         cue = np.array(obs["ball_positions"][0])
+        cue_pred_next = cue_kp.decode_cue(z_pred)
+        cue_pred_final = cue_kp.decode_cue(info["predicted_final_latent"])
 
         it = info["history"]
         print(f"[step {step}] action: L={act['left_pwm']:+.2f} R={act['right_pwm']:+.2f} "
               f"fire={act['fire']!s:5} force={act['fire_force']:.2f} | "
               f"CEM best cost {it[0]['best_cost']:.3f} -> {it[-1]['best_cost']:.3f}")
-        print(f"          next latent: predicted vs actual error {torch.norm(z_pred - z_actual):.3f} "
-              f"| dist to goal: predicted {torch.norm(z_pred - z_goal):.3f}, actual {torch.norm(z_actual - z_goal):.3f}")
-        print(f"          cue ball now ({cue[0]:+.3f}, {cue[1]:+.3f}) m, "
-              f"{100 * np.linalg.norm(cue - target):.1f} cm from target")
+        pred_err = float(((z_pred - z_actual) * w.sqrt()).norm())
+        print(f"          cue-keypoint latent: predicted-vs-actual error {pred_err:.3f} "
+              f"| dist to goal: predicted {goal_dist(z_pred):.3f}, actual {goal_dist(z_actual):.3f}")
+        print(f"          cue ball: predicted next ({cue_pred_next[0]:+.3f}, {cue_pred_next[1]:+.3f}), "
+              f"actual ({cue[0]:+.3f}, {cue[1]:+.3f}) m, {100 * np.linalg.norm(cue - target):.1f} cm from target; "
+              f"plan's imagined end ({cue_pred_final[0]:+.3f}, {cue_pred_final[1]:+.3f})")
 
-    # Let the balls roll out and report where the cue ball ends up.
     for _ in range(args.settle_steps):
         obs = env.step(dict(left_pwm=0.0, right_pwm=0.0, fire=False, fire_force=0.0))
     cue = np.array(obs["ball_positions"][0])
@@ -346,6 +480,11 @@ if __name__ == "__main__":
                         help="Plan-execute-replan steps (1 = plan once, execute the first action)")
     parser.add_argument("--settle-steps", type=int, default=30)
     parser.add_argument("--target-dist", type=float, default=0.10, help="m along robot heading")
+    parser.add_argument("--calib-scenes", type=int, default=400)
+    parser.add_argument("--checkpoint-dir", default=CHECKPOINT_DIR)
+    parser.add_argument("--suffix", default="_best", help="checkpoint suffix: _best, '' (final), _epoch10, ...")
+    parser.add_argument("--background", default=BACKGROUND_PATH,
+                        help="training background image (frames_background.npy next to the frame cache)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--untrained", action="store_true")
     run_test(parser.parse_args())
