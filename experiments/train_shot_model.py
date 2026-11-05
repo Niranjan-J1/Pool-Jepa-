@@ -56,6 +56,9 @@ def parse_args():
                    help="one or more globs in --data-dir (files matched by several are used once)")
     p.add_argument("--checkpoint-dir", default=cem.CHECKPOINT_DIR)
     p.add_argument("--suffix", default="_best", help="encoder checkpoint suffix")
+    p.add_argument("--out-suffix", default=None,
+                   help="save as shot_model{out_suffix}.pt (default: --suffix); the planners load "
+                        "it with --suffix <out_suffix> and find the encoder from its .json")
     p.add_argument("--encoder", choices=["auto", "target", "online"], default="auto",
                    help="frozen encoder (auto: target_encoder if saved, else encoder)")
     p.add_argument("--background", default=None,
@@ -202,7 +205,8 @@ def main():
     model.load_state_dict(best_state)
     model.eval().cpu()
 
-    out = os.path.join(args.checkpoint_dir, f"shot_model{args.suffix}.pt")
+    out_suffix = args.suffix if args.out_suffix is None else args.out_suffix
+    out = os.path.join(args.checkpoint_dir, f"shot_model{out_suffix}.pt")
     save_shot_model(model, out, {"encoder_file": enc_file, "data": files, "n_shots": n,
                                  "force_range": [float(force.min()), float(force.max())],
                                  "use_heading": use_heading, "hidden": args.hidden, "depth": args.depth,
