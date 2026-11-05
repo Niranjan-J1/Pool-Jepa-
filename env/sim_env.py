@@ -20,6 +20,7 @@ ROBOT_WIDTH = 0.06
 ROBOT_LENGTH = 0.08
 ROBOT_MASS = 0.5
 WHEEL_SEPARATION = ROBOT_WIDTH
+MAX_WHEEL_SPEED = 0.3  # m/s at |pwm| = 1 -> max yaw rate 2 * 0.3 / 0.06 = 10 rad/s
 
 # Ball properties
 BALL_RADIUS = 0.01
@@ -233,18 +234,13 @@ class SimEnv(BaseEnv):
         left_pwm = max(-1.0, min(1.0, action["left_pwm"]))
         right_pwm = max(-1.0, min(1.0, action["right_pwm"]))
 
-        max_wheel_speed = 0.3  # m/s
-        vl = left_pwm * max_wheel_speed
-        vr = right_pwm * max_wheel_speed
-
+        # Differential-drive kinematics: wheel speeds set the body's forward speed and yaw
+        # rate directly (no sideways slip, no coasting; zero PWM = stopped). The velocity
+        # is re-imposed every substep, so the robot pushes balls but is not pushed back.
+        vl = left_pwm * MAX_WHEEL_SPEED
+        vr = right_pwm * MAX_WHEEL_SPEED
         v_linear = (vl + vr) / 2.0
         omega = (vr - vl) / WHEEL_SEPARATION
-
-        angle = self._robot_body.angle
-        fx = v_linear * math.cos(angle) * ROBOT_MASS * 10
-        fy = v_linear * math.sin(angle) * ROBOT_MASS * 10
-        self._robot_body.apply_force_at_local_point((fx, 0), (0, 0))
-        self._robot_body.torque = omega * self._robot_body.moment * 10
 
         if action.get("fire", False):
             force = max(0.0, min(1.0, action.get("fire_force", 0.5)))
@@ -263,7 +259,10 @@ class SimEnv(BaseEnv):
             self.last_strike_connected = False
 
         sub_dt = DT / SUBSTEPS
+        rb = self._robot_body
         for _ in range(SUBSTEPS):
+            rb.velocity = (v_linear * math.cos(rb.angle), v_linear * math.sin(rb.angle))
+            rb.angular_velocity = omega
             self._space.step(sub_dt)
             self._apply_rolling_resistance(sub_dt)
 
