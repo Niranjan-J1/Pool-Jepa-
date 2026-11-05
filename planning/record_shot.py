@@ -238,7 +238,7 @@ def main(args):
     env = SimEnv()
     s2 = Stage2(SimpleNamespace(checkpoint_dir=args.checkpoint_dir, suffix=args.suffix,
                                 background=args.background, calib_scenes=args.calib_scenes,
-                                seed=0), env, device)
+                                calib_near_robot=args.calib_near_robot, seed=0), env, device)
     ctl = AimController()
 
     if args.scan:
@@ -282,4 +282,6 @@ if __name__ == "__main__":
     p.add_argument("--suffix", default="_best")
     p.add_argument("--background", default=cem.BACKGROUND_PATH)
     p.add_argument("--calib-scenes", type=int, default=400)
+    p.add_argument("--calib-near-robot", type=float, default=0.0,
+                   help="extra share of calibration scenes with the robot right behind the cue ball")
     main(p.parse_args())

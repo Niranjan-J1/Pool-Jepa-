@@ -24,16 +24,21 @@ import torch.nn as nn
 
 
 class ShotModel(nn.Module):
-    def __init__(self, latent_dim: int = 64, hidden_dim: int = 256, use_heading: bool = False):
+    """MLP of `depth` hidden blocks (Linear -> LayerNorm -> Mish) of width hidden_dim, then a
+    zero-initialised output layer. depth=3, hidden_dim=256 is the original model; any
+    width/depth keeps the same parameter names (net.<i>.*), so load_shot_model reads both."""
+
+    def __init__(self, latent_dim: int = 64, hidden_dim: int = 256, use_heading: bool = False,
+                 depth: int = 3):
         super().__init__()
         self.use_heading = use_heading
         extra = 3 if use_heading else 1  # (sin, cos, force) or (force,)
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + extra, hidden_dim), nn.LayerNorm(hidden_dim), nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Mish(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
+        layers, width_in = [], latent_dim + extra
+        for _ in range(depth):
+            layers += [nn.Linear(width_in, hidden_dim), nn.LayerNorm(hidden_dim), nn.Mish()]
+            width_in = hidden_dim
+        layers.append(nn.Linear(hidden_dim, latent_dim))
+        self.net = nn.Sequential(*layers)
         # Start as "nothing moves"; training learns the displacement.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
@@ -66,7 +71,9 @@ def load_shot_model(path: str, device="cpu") -> tuple[ShotModel, dict]:
     use_heading = "heading_flag" in state
     hidden = state["net.0.weight"].shape[0]
     latent = state["net.0.weight"].shape[1] - (3 if use_heading else 1)
-    model = ShotModel(latent, hidden, use_heading=use_heading)
+    # Linear weights are the 2-D net.<i>.weight tensors; all but the output layer are hidden blocks.
+    n_linear = sum(1 for k, v in state.items() if k.startswith("net.") and k.endswith(".weight") and v.dim() == 2)
+    model = ShotModel(latent, hidden, use_heading=use_heading, depth=n_linear - 1)
     model.load_state_dict(state)
     meta_path = path.replace(".pt", ".json")
     meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}

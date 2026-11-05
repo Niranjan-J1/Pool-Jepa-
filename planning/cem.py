@@ -317,6 +317,8 @@ class CueKeypoints:
     affine: np.ndarray        # (K, 3, 2): [cue_x, cue_y, 1] @ affine[k] -> keypoint k (x, y)
     readout: np.ndarray       # (2*K_sel + 1, 2): [selected dims, 1] @ readout -> cue (x, y)
     readout_r2: float         # held-out R^2 of the readout on calibration scenes
+    err_far_cm: float = float("nan")    # held-out mean readout error, robot not near the cue ball
+    err_near_cm: float = float("nan")   # same, robot right behind the cue ball (near-robot scenes)
 
     @property
     def dim_weights(self) -> np.ndarray:
@@ -352,15 +354,46 @@ def _affine_r2(X, Y):
     return A, 1.0 - ss_res / ss_tot
 
 
+def place_robot_behind(env, cue_xy, rng, gap_range=(0.02, 0.10), max_offset=math.pi / 4, tries=50):
+    """Teleport the robot so its front is gap_range behind the cue ball, heading within
+    max_offset of the robot->cue line (like a behind_cue reset or a Stage-1 firing pose),
+    clear of the cushions and every ball. Returns True if a valid pose was found."""
+    from env.sim_env import ROBOT_LENGTH, BALL_RADIUS
+    others = [b.position for name, b in env._ball_bodies.items() if name != "cue"]
+    for _ in range(tries):
+        a = rng.uniform(-math.pi, math.pi)                      # direction robot -> cue
+        heading = a + rng.uniform(-max_offset, max_offset)
+        gap = rng.uniform(*gap_range)
+        front = (cue_xy[0] - gap * math.cos(a), cue_xy[1] - gap * math.sin(a))
+        pos = (front[0] - ROBOT_LENGTH / 2 * math.cos(heading), front[1] - ROBOT_LENGTH / 2 * math.sin(heading))
+        if not all(env._inside_table(x, y, 0.005) for x, y in env._robot_corners(pos, heading)):
+            continue
+        if env._overlaps_robot(tuple(cue_xy), pos, heading, BALL_RADIUS) or \
+                any(env._overlaps_robot((o.x, o.y), pos, heading, BALL_RADIUS + 0.005) for o in others):
+            continue
+        rb = env._robot_body
+        rb.position, rb.angle = pos, heading
+        env._space.reindex_shapes_for_body(rb)
+        return True
+    return False
+
+
 @torch.no_grad()
 def calibrate_cue_keypoints(goal_encoder, env, background, device, n_scenes=400, min_r2=0.3,
-                            seed=0) -> CueKeypoints:
+                            seed=0, near_robot_fraction=0.0) -> CueKeypoints:
     """Render scenes with the cue ball placed independently of the robot, encode them, and
     find keypoints whose (x, y) follow the cue ball more than the robot.
 
     In behind_cue episodes the cue ball starts right in front of the robot, so cue and robot
     positions are correlated; teleporting the cue ball to a uniform random spot breaks that,
     so a robot-tracking keypoint can't pass as a cue keypoint.
+
+    near_robot_fraction > 0 adds that share of scenes with the robot teleported right behind
+    the (uniformly placed) cue ball, front 2-10 cm away: where the robot is when Stage 1 aims and
+    Stage 2 fires, but rare among the independent scenes. Keypoint SELECTION still uses only the
+    independent scenes (so robot-tracking keypoints stay out); the linear READOUT is fit on all
+    of them, so it can correct a shift the nearby robot causes in the cue keypoints. Held-out
+    readout error is reported separately for robot-near and robot-far scenes.
     """
     import random
     from env.sim_env import BALL_RADIUS, CUSHION_THICKNESS, TABLE_LENGTH, TABLE_WIDTH
@@ -368,37 +401,60 @@ def calibrate_cue_keypoints(goal_encoder, env, background, device, n_scenes=400,
     py_state = random.getstate()
     random.seed(seed)  # env.reset() draws from `random`; seed it so keypoint selection is reproducible
     lim = np.array([TABLE_LENGTH / 2, TABLE_WIDTH / 2]) - CUSHION_THICKNESS - BALL_RADIUS - 0.005
-    Z, cue, robot = [], [], []
-    while len(Z) < n_scenes:
+    n_near = int(round(n_scenes * near_robot_fraction))
+    Z, cue, robot, near = [], [], [], []
+    while len(Z) < n_scenes + n_near:
+        is_near = len(Z) >= n_scenes
         obs = env.reset(setup="behind_cue")
-        rx, ry, th = obs["robot_pose"]
         p = rng.uniform(-lim, lim)
+        if is_near:
+            env._ball_bodies["cue"].position = tuple(p)
+            if any(np.hypot(*(np.array(b.position) - p)) < 2 * BALL_RADIUS + 0.005
+                   for name, b in env._ball_bodies.items() if name != "cue"):
+                continue
+            if not place_robot_behind(env, p, rng):
+                continue
+            obs = env._get_observation(render=False)
+        rx, ry, th = obs["robot_pose"]
         if env._overlaps_robot(tuple(p), (rx, ry), th, BALL_RADIUS):
             continue
         frame = render_with_cue_at(env, tuple(p))
         Z.append(encode(goal_encoder, frame, frame, background, device).cpu().numpy())
         cue.append(p)
         robot.append((rx, ry))
+        near.append(is_near)
     random.setstate(py_state)  # leave the caller's random stream untouched
-    Z, cue, robot = np.array(Z), np.array(cue), np.array(robot)
+    Z, cue, robot, near = np.array(Z), np.array(cue), np.array(robot), np.array(near)
     kps = Z.reshape(len(Z), -1, 2)
     n_kp = kps.shape[1]
 
+    ind = ~near  # independent scenes: keypoint selection and goal affines
     r2_cue, r2_robot, affine = np.zeros(n_kp), np.zeros(n_kp), np.zeros((n_kp, 3, 2))
     for k in range(n_kp):
-        affine[k], r2_cue[k] = _affine_r2(cue, kps[:, k])
-        _, r2_robot[k] = _affine_r2(robot, kps[:, k])
+        affine[k], r2_cue[k] = _affine_r2(cue[ind], kps[ind, k])
+        _, r2_robot[k] = _affine_r2(robot[ind], kps[ind, k])
     selected = (r2_cue >= min_r2) & (r2_cue > r2_robot)
 
     readout, readout_r2 = np.zeros((1, 2)), float("nan")
+    err_far = err_near = float("nan")
     if selected.any():
         feats = kps[:, selected].reshape(len(Z), -1)
-        n_tr = int(0.8 * len(Z))
-        A, _ = _affine_r2(feats[:n_tr], cue[:n_tr])
-        pred = np.concatenate([feats[n_tr:], np.ones((len(Z) - n_tr, 1))], 1) @ A
-        readout_r2 = 1 - ((pred - cue[n_tr:]) ** 2).sum() / ((cue[n_tr:] - cue[:n_tr].mean(0)) ** 2).sum()
+        # hold out the last 20% of each kind of scene
+        idx_ind, idx_near = np.flatnonzero(ind), np.flatnonzero(near)
+        ho = np.r_[idx_ind[int(0.8 * len(idx_ind)):], idx_near[int(0.8 * len(idx_near)):]]
+        tr = np.setdiff1d(np.arange(len(Z)), ho)
+        A, _ = _affine_r2(feats[tr], cue[tr])
+        pred = np.concatenate([feats[ho], np.ones((len(ho), 1))], 1) @ A
+        ho_ind = ho[~near[ho]]
+        p_ind = pred[~near[ho]]
+        readout_r2 = 1 - ((p_ind - cue[ho_ind]) ** 2).sum() / ((cue[ho_ind] - cue[tr].mean(0)) ** 2).sum()
+        err = 100 * np.linalg.norm(pred - cue[ho], axis=1)
+        # "far": independent scenes whose robot centre is > 15 cm from the cue ball
+        far_mask = ~near[ho] & (np.linalg.norm(robot[ho] - cue[ho], axis=1) > 0.15)
+        err_far = float(err[far_mask].mean()) if far_mask.any() else float("nan")
+        err_near = float(err[near[ho]].mean()) if near[ho].any() else float("nan")
         readout, _ = _affine_r2(feats, cue)  # refit on everything for use
-    return CueKeypoints(r2_cue, r2_robot, selected, affine, readout, float(readout_r2))
+    return CueKeypoints(r2_cue, r2_robot, selected, affine, readout, float(readout_r2), err_far, err_near)
 
 
 def load_background(env, path=BACKGROUND_PATH, n=200):

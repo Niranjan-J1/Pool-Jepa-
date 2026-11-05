@@ -11,6 +11,11 @@ Modes:
                      ground-truth positions before/after. Training data for the shot-outcome
                      model. Physics between the strike and rest is not rendered, so this is
                      fast (~0.1 s/shot). Saved as shots_XXX.npz.
+                     Long-shot data: --force-bias 2 favours hard shots, --min-travel 0.08
+                     --straight-only keeps cue balls that roll >= 8 cm without touching a
+                     cushion or ball (rejected shots are re-drawn), e.g.
+                         --mode shot_pairs --episodes 5000 --force-range 0.1 0.3 --force-bias 2
+                         --min-travel 0.08 --straight-only --prefix shots_long --seed 1
 
 Output directory: $POOLJEPA_DATA if set, else data/datasets.
 
@@ -156,30 +161,79 @@ def collect(mode="random_drive", episodes=None, prefix=None):
           f"({100 * total_connected / max(1, total_fires):.1f}%)")
 
 
-def collect_shots(episodes=None, prefix=None, force_range=SHOT_FORCE_RANGE):
-    """shot_pairs mode: (two frames before, frame at rest) per strike."""
+STRAIGHT_LATERAL_TOL = 0.001  # m: cue ball counts as rolling straight while within 1 mm of its line
+
+
+def settle_tracking(env, idle, heading, max_steps=SHOT_MAX_SETTLE_STEPS):
+    """env.settle() that also reports whether the cue ball rolled out straight along `heading`
+    (the strike direction) without touching a cushion or another ball: it never leaves the
+    line by more than STRAIGHT_LATERAL_TOL, never moves backwards, and no other ball moves.
+    Returns (rendered final obs, steps, straight)."""
+    start = np.array(env._get_observation(render=False)["ball_positions"])
+    u = np.array([np.cos(heading), np.sin(heading)])
+    n_vec = np.array([-u[1], u[0]])
+    straight, last = True, 0.0
+    for n in range(1, max_steps + 1):
+        obs = env.step(idle, render=False)
+        if straight:
+            b = np.array(obs["ball_positions"])
+            d = b[0] - start[0]
+            along = float(d @ u)
+            if abs(float(d @ n_vec)) > STRAIGHT_LATERAL_TOL or along < last - 1e-4 or \
+                    (np.linalg.norm(b[1:] - start[1:], axis=1) > 1e-4).any():
+                straight = False
+            last = max(last, along)
+        if obs["ball_settled"]:
+            break
+    return env._get_observation(), n, straight
+
+
+def sample_force(force_range, bias):
+    """bias = 1: uniform. bias > 1: density rises toward the top of the range
+    (f = lo + (hi - lo) * u^(1/bias); bias = 2 -> linear ramp, 3 -> quadratic)."""
+    lo, hi = force_range
+    return lo + (hi - lo) * random.random() ** (1.0 / bias)
+
+
+def collect_shots(episodes=None, prefix=None, force_range=SHOT_FORCE_RANGE, force_bias=1.0,
+                  min_travel=0.0, straight_only=False, max_tries=200):
+    """shot_pairs mode: (two frames before, frame at rest) per strike.
+
+    force_bias > 1 favours harder shots. min_travel / straight_only reject shots whose cue ball
+    travels less than min_travel (m) / does not roll out straight (cushion or ball contact); a
+    rejected shot is re-drawn (new scene and force), up to max_tries per kept shot. Every saved
+    shot records `cue_travel` (m) and `straight`, so training can report long shots separately."""
     n_episodes = episodes or MODES["shot_pairs"]["episodes"]
     prefix = prefix or MODES["shot_pairs"]["prefix"]
-    print(f"Mode: shot_pairs  episodes={n_episodes}  force range {force_range}  "
-          f"-> {prefix}_XXX.npz in {DATASETS_DIR}")
+    print(f"Mode: shot_pairs  shots={n_episodes}  force range {force_range} bias {force_bias}  "
+          f"min travel {min_travel} m  straight only {straight_only}  -> {prefix}_XXX.npz in {DATASETS_DIR}")
     os.makedirs(DATASETS_DIR, exist_ok=True)
     env = SimEnv()
     idle = Action(left_pwm=0.0, right_pwm=0.0, fire=False, fire_force=0.0)
     keys = ["frame_pre_prev", "frame_pre", "frame_post", "fire_force", "strike_connected",
             "robot_pose_pre", "ball_positions_pre", "ball_positions_post", "settle_steps",
-            "setup_distance", "setup_aim_offset"]
+            "setup_distance", "setup_aim_offset", "cue_travel", "straight"]
     buf = {k: [] for k in keys}
-    t0, file_idx, unsettled = time.time(), 0, 0
+    t0, file_idx, unsettled, attempts = time.time(), 0, 0, 0
 
     for ep in range(n_episodes):
-        obs = env.reset(setup=RESET_SETUP)
-        f_prev = obs["frame"]
-        obs = env.step(idle)  # robot at rest: encoder input before the shot is (f_prev, f_pre)
-        force = random.uniform(*force_range)
-        pre = obs
-        env.step(Action(left_pwm=0.0, right_pwm=0.0, fire=True, fire_force=force), render=False)
-        connected = env.last_strike_connected
-        post, n_steps = env.settle(SHOT_MAX_SETTLE_STEPS)
+        for _ in range(max_tries):
+            attempts += 1
+            obs = env.reset(setup=RESET_SETUP)
+            f_prev = obs["frame"]
+            obs = env.step(idle)  # robot at rest: encoder input before the shot is (f_prev, f_pre)
+            force = sample_force(force_range, force_bias)
+            pre = obs
+            env.step(Action(left_pwm=0.0, right_pwm=0.0, fire=True, fire_force=force), render=False)
+            connected = env.last_strike_connected
+            post, n_steps, straight = settle_tracking(env, idle, pre["robot_pose"][2])
+            straight = straight and connected
+            travel = float(np.linalg.norm(np.subtract(post["ball_positions"][0], pre["ball_positions"][0])))
+            if travel >= min_travel and (straight or not straight_only):
+                break
+        else:
+            raise RuntimeError(f"no shot met min_travel={min_travel} straight_only={straight_only} "
+                               f"in {max_tries} tries; loosen the filter or raise the force range")
         unsettled += not post["ball_settled"]
 
         buf["frame_pre_prev"].append(f_prev)
@@ -193,15 +247,18 @@ def collect_shots(episodes=None, prefix=None, force_range=SHOT_FORCE_RANGE):
         buf["settle_steps"].append(n_steps)
         buf["setup_distance"].append(env.last_setup.get("distance", np.nan))
         buf["setup_aim_offset"].append(env.last_setup.get("aim_offset", np.nan))
+        buf["cue_travel"].append(travel)
+        buf["straight"].append(straight)
 
         if (ep + 1) % SHOTS_PER_FILE == 0 or ep + 1 == n_episodes:
             path = os.path.join(DATASETS_DIR, f"{prefix}_{file_idx:03d}.npz")
             arrays = {k: np.array(v, dtype=np.uint8 if k.startswith("frame") else
-                                  np.bool_ if k == "strike_connected" else
+                                  np.bool_ if k in ("strike_connected", "straight") else
                                   np.int32 if k == "settle_steps" else np.float32)
                       for k, v in buf.items()}
             np.savez_compressed(path, **arrays)
-            print(f"Shot {ep + 1}/{n_episodes}  ({(ep + 1) / (time.time() - t0):.1f} shots/s)  "
+            print(f"Shot {ep + 1}/{n_episodes}  ({(ep + 1) / (time.time() - t0):.1f} shots/s, "
+                  f"{100 * (ep + 1) / attempts:.0f}% of attempts kept)  "
                   f"Saved {path} ({os.path.getsize(path) / 2**20:.1f} MB)", flush=True)
             file_idx += 1
             for v in buf.values():
@@ -218,8 +275,20 @@ if __name__ == "__main__":
     parser.add_argument("--prefix", default=None, help="Override the output file prefix")
     parser.add_argument("--force-range", type=float, nargs=2, default=SHOT_FORCE_RANGE,
                         metavar=("MIN", "MAX"), help="shot_pairs: strike force range")
+    parser.add_argument("--force-bias", type=float, default=1.0,
+                        help="shot_pairs: >1 favours harder shots (2 = linear ramp toward MAX)")
+    parser.add_argument("--min-travel", type=float, default=0.0,
+                        help="shot_pairs: keep only shots whose cue ball travels at least this far (m)")
+    parser.add_argument("--straight-only", action="store_true",
+                        help="shot_pairs: keep only shots where the cue ball rolls out straight "
+                             "(no cushion or ball contact)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="seed the scene/force RNG (use different seeds for different runs)")
     args = parser.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
     if args.mode == "shot_pairs":
-        collect_shots(args.episodes, args.prefix, tuple(args.force_range))
+        collect_shots(args.episodes, args.prefix, tuple(args.force_range), args.force_bias,
+                      args.min_travel, args.straight_only)
     else:
         collect(args.mode, args.episodes, args.prefix)

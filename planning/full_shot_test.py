@@ -132,13 +132,15 @@ class Stage2:
         self.encoder.eval()
         self.background = cem.load_background(env, args.background)
         self.kp = cem.calibrate_cue_keypoints(self.encoder, env, self.background, device,
-                                              n_scenes=args.calib_scenes, seed=args.seed)
+                                              n_scenes=args.calib_scenes, seed=args.seed,
+                                              near_robot_fraction=getattr(args, "calib_near_robot", 0.0))
         self.f_lo, self.f_hi = meta.get("force_range", [0.05, 1.0])
         self.planner = ShotPlanner(self.model, self.kp, device, forces=force_grid(self.f_lo, self.f_hi))
         self.device = device
         print(f"Loaded {os.path.basename(shot_path)} + frozen encoder {enc_file} "
               f"(heading input: {'yes' if self.model.use_heading else 'no'}); "
-              f"{self.kp.selected.sum()} cue keypoints, readout R^2 {self.kp.readout_r2:.3f}")
+              f"{self.kp.selected.sum()} cue keypoints, readout R^2 {self.kp.readout_r2:.3f}, "
+              f"held-out error {self.kp.err_far_cm:.2f} cm robot far / {self.kp.err_near_cm:.2f} cm robot near")
 
     def decode_cue(self, frame):
         # Same (frame, frame) pair the keypoint readout was calibrated on.
@@ -279,6 +281,9 @@ if __name__ == "__main__":
     p.add_argument("--trials", type=int, default=100)
     p.add_argument("--show", type=int, default=10, help="print the first N trials")
     p.add_argument("--calib-scenes", type=int, default=400)
+    p.add_argument("--calib-near-robot", type=float, default=0.0,
+                   help="extra share of calibration scenes with the robot right behind the cue ball "
+                        "(fits the cue readout where Stage 1/2 use it; 0 = original calibration)")
     p.add_argument("--avoid-balls", action="store_true",
                    help="give Stage 1 the true positions of the other balls to path around")
     p.add_argument("--seed", type=int, default=0)
