@@ -3,6 +3,7 @@
     python planning/record_shot.py --scan 60                 # list clean seeds
     python planning/record_shot.py --seed 59                 # one clip per seed
     python planning/record_shot.py --montage --seed 0 59 33 18   # one video, shots back to back
+    python planning/record_shot.py --montage --pace social --seed 59 33   # short cut for X/LinkedIn
 
 The scene for a seed is built exactly as in full_shot_test.py: a behind_cue scene and a
 straight-line reachable target (the rest point of a secret force fired from the exact firing
@@ -57,6 +58,16 @@ from planning.shot_planner import IDLE
 
 FPS = 60
 
+# Per-phase timing (seconds unless noted). "social" is for X/LinkedIn: aiming sped up (labelled),
+# short holds, a 1 s title and no per-shot cards; the imagining sweep and the shot itself keep
+# their full clarity (the sweep is shortened but still visible, the shot keeps --shot-slowmo).
+PACES = {
+    "full":   dict(find=2.0, aim_speed=1, reveal=1.4, spray=0.7, lock=0.8, hold=0.9, result=3.5,
+                   intro=2.4, intro_sub=True, shot_card=1.6, outro=3.0),
+    "social": dict(find=0.5, aim_speed=3, reveal=0.8, spray=0.25, lock=0.35, hold=0.5, result=1.5,
+                   intro=1.0, intro_sub=False, shot_card=0.0, outro=1.2),
+}
+
 
 def snap(env):
     rb = env._robot_body
@@ -84,10 +95,14 @@ def inset_data(s2, raw, z, cue):
 # One episode
 # --------------------------------------------------------------------------------------
 
-def run_episode(env, s2, ctl, scene, t, timeline=None, slowmo=1.5):
+def run_episode(env, s2, ctl, scene, t, timeline=None, slowmo=1.5, pace=None):
     """Stage 1 -> Stage 2 -> fire on a sampled scene. With a timeline list, appends
-    (state, overlay) items for demo_render (one per output frame)."""
+    (state, overlay) items for demo_render (one per output frame). pace: a PACES entry."""
     record = timeline is not None
+    pace = pace or PACES["full"]
+    speed = max(1, int(pace["aim_speed"]))
+    aim_sub = "driving behind the cue ball and lining up with the target" + (
+        f"  ·  {speed}x speed" if speed > 1 else "")
     target = np.asarray(t["target"])
     random.setstate(scene)
     obs = env.reset(setup="behind_cue")
@@ -101,12 +116,22 @@ def run_episode(env, s2, ctl, scene, t, timeline=None, slowmo=1.5):
     if record:
         cue_first, ins = perceive(s2, env.render(), with_inset=True)
         s0 = snap(env)
-        for i in range(int(2.0 * FPS)):
+        n_find = int(pace["find"] * FPS)
+        for i in range(n_find):   # fades scaled to the phase length (25 / 30 / 30 frames at 2 s)
+            k = i / max(1, n_find - 1) * 2.0 * FPS
             add(s0, stage="Finding the cue ball", sub="located from raw camera pixels by a learned encoder",
-                target_alpha=min(1.0, i / 25), cue_est=cue_first,
-                cue_alpha=float(np.clip((i - 30) / 30, 0, 1)), inset=ins)
+                target_alpha=min(1.0, k / 25), cue_est=cue_first,
+                cue_alpha=float(np.clip((k - 30) / 30, 0, 1)), inset=ins)
 
-    # Aiming (Stage 1)
+    # Aiming (Stage 1): one physics step per frame, or every speed-th step when sped up
+    aim_frames = 0
+
+    def add_aim(**ov):
+        nonlocal aim_frames
+        if aim_frames % speed == 0:
+            add(snap(env), **ov)
+        aim_frames += 1
+
     ctl.reset()
     cue_est, done, n, ins = None, False, 0, None
     for n in range(STAGE1_MAX_STEPS):
@@ -114,8 +139,7 @@ def run_episode(env, s2, ctl, scene, t, timeline=None, slowmo=1.5):
             cue_est, ins = perceive(s2, env.render(), with_inset=record)
         left, right, done, info = ctl.step(obs["robot_pose"], cue_est, target,
                                            np.array(obs["ball_positions"][1:]))
-        add(snap(env), stage="Aiming", sub="driving behind the cue ball and lining up with the target",
-            cue_est=cue_est, aim_line=True, inset=ins)
+        add_aim(stage="Aiming", sub=aim_sub, cue_est=cue_est, aim_line=True, inset=ins)
         if done:
             break
         obs = env.step(dict(IDLE, left_pwm=left, right_pwm=right), render=False)
@@ -123,8 +147,7 @@ def run_episode(env, s2, ctl, scene, t, timeline=None, slowmo=1.5):
         if env._balls_settled():
             break
         env.step(IDLE, render=False)
-        add(snap(env), stage="Aiming", sub="driving behind the cue ball and lining up with the target",
-            cue_est=cue_est, aim_line=True, inset=ins)
+        add_aim(stage="Aiming", sub=aim_sub, cue_est=cue_est, aim_line=True, inset=ins)
     obs = env._get_observation(render=False)
     balls = np.array(obs["ball_positions"])
     disturbed = bool((np.linalg.norm(balls[1:] - balls0[1:], axis=1) > BALL_MOVED).any())
@@ -145,7 +168,7 @@ def run_episode(env, s2, ctl, scene, t, timeline=None, slowmo=1.5):
         chosen = int(np.argmin(costs))
         label = f"Imagining {n_forces} shots"
         sub = "predicting where each strike strength would leave the cue ball"
-        reveal, spray, lock_n, hold = int(1.4 * FPS), int(0.7 * FPS), int(0.8 * FPS), int(0.9 * FPS)
+        reveal, spray, lock_n, hold = (max(1, int(pace[k] * FPS)) for k in ("reveal", "spray", "lock", "hold"))
         fan = lambda shown, lock, lf=None: dict(start=cue_now, ends=ends, costs=costs, shown=shown,
                                                  chosen=chosen, lock=lock, lock_frame=lf)
         for i in range(reveal):     # sweep from soft to hard strikes
@@ -188,7 +211,7 @@ def run_episode(env, s2, ctl, scene, t, timeline=None, slowmo=1.5):
                          lock_frame=lock_at, only_chosen=True),
                 burst=(i / 14) if i < 14 else None)
         end = frames[-1][0]
-        for i in range(int(3.5 * FPS)):
+        for i in range(int(pace["result"] * FPS)):
             add(end, stage="Result", inset=insets[-1],
                 result=dict(predicted=pinfo["predicted_rest"], actual=rest, miss=miss, travel=travel,
                             force=force, n_forces=n_forces, alpha=min(1.0, i / 20)))
@@ -289,6 +312,7 @@ def main(args):
 
     os.makedirs(args.out_dir, exist_ok=True)
     renderer = DemoRenderer(pockets=not args.no_pockets)
+    pace = PACES[args.pace]
 
     def episode(seed):
         scene, t = scene_for_seed(env, s2, seed)
@@ -296,7 +320,7 @@ def main(args):
             print(f"seed {seed}: no straight reachable target; skipped")
             return None, None
         timeline = []
-        st = run_episode(env, s2, ctl, scene, t, timeline=timeline, slowmo=args.shot_slowmo)
+        st = run_episode(env, s2, ctl, scene, t, timeline=timeline, slowmo=args.shot_slowmo, pace=pace)
         print(describe(seed, st, is_clean(st, args)))
         if not is_clean(st, args):
             print("  note: this seed is not clean (see criteria in the docstring); rendering anyway")
@@ -304,22 +328,28 @@ def main(args):
 
     if args.montage:
         seeds = "_".join(map(str, args.seed))
-        out = VideoOut(os.path.join(args.out_dir, f"montage{args.suffix}_{seeds}"), args)
-        add_card(out, renderer, "A robot that imagines its shots",
-                 "it finds the cue ball from camera pixels and predicts each strike before taking it",
-                 seconds=2.4)
+        tag = "" if args.pace == "full" else f"_{args.pace}"
+        out = VideoOut(os.path.join(args.out_dir, f"montage{args.suffix}{tag}_{seeds}"), args)
+        if pace["intro"] > 0:
+            add_card(out, renderer, "A robot that imagines its shots",
+                     "it finds the cue ball from camera pixels and predicts each strike before taking it"
+                     if pace["intro_sub"] else "", seconds=pace["intro"])
         misses = []
         for i, seed in enumerate(args.seed):
             st, timeline = episode(seed)
             if st is None:
                 continue
             misses.append(st["miss"])
-            add_card(out, renderer, f"Shot {i + 1} of {len(args.seed)}",
-                     f"target {100 * st['travel']:.0f} cm away")
+            if pace["shot_card"] > 0:
+                add_card(out, renderer, f"Shot {i + 1} of {len(args.seed)}",
+                         f"target {100 * st['travel']:.0f} cm away", seconds=pace["shot_card"])
+            n0 = out.n
             add_shot(out, renderer, timeline)
-        add_card(out, renderer, f"{len(misses)} shots, average miss {100 * np.mean(misses):.1f} cm",
-                 "learned perception + a learned model of where each strike leaves the cue ball",
-                 note=args.montage_note, seconds=3.0)
+            print(f"  shot {i + 1} (seed {seed}): {(out.n - n0) / FPS:.1f} s")
+        if pace["outro"] > 0:
+            add_card(out, renderer, f"{len(misses)} shots, average miss {100 * np.mean(misses):.1f} cm",
+                     "learned perception + a learned model of where each strike leaves the cue ball",
+                     note=args.montage_note, seconds=pace["outro"])
         out.close()
         return
 
@@ -338,6 +368,8 @@ if __name__ == "__main__":
                    help="scene seed(s) to record (with --scan: the first seed scanned)")
     p.add_argument("--scan", type=int, default=0, help="try this many seeds without recording; list clean ones")
     p.add_argument("--montage", action="store_true", help="record all --seed shots into one video")
+    p.add_argument("--pace", choices=sorted(PACES), default="full",
+                   help="phase timing: full (original) or social (~6-7 s per shot, for X/LinkedIn)")
     p.add_argument("--montage-note", default="simulation · selected successful shots from a 60-scene scan",
                    help="small print on the closing card")
     p.add_argument("--out-dir", default=os.path.join(cem.REPO, "videos"))
