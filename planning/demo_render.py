@@ -54,6 +54,13 @@ def _font(size, bold=False):
             return ImageFont.load_default()
 
 
+def _opt(d, key, default):
+    """d[key], or default when the key is missing OR its value is None (dict.get only covers
+    a missing key, and the overlay dicts pass explicit Nones)."""
+    v = d.get(key)
+    return default if v is None else v
+
+
 def _resize(a, size):
     return np.asarray(Image.fromarray(a.astype(np.float32), mode="F").resize(size, Image.BICUBIC))
 
@@ -372,7 +379,7 @@ class DemoRenderer:
 
         # target crosshair
         if ov.get("target") is not None:
-            ta = ov.get("target_alpha", 1.0)
+            ta = _opt(ov, "target_alpha", 1.0)
             tx, ty = self.px(ov["target"])
             rr = 2.1 * r_px * (1 + 0.10 * math.sin(2 * math.pi * self.n / 70))
             col = GOLD + (int(255 * ta),)
@@ -383,14 +390,14 @@ class DemoRenderer:
 
         if ov.get("aim_line") and ov.get("cue_est") is not None:
             self._dashed(d, self.px(ov["cue_est"]), self.px(ov["target"]),
-                         (255, 255, 255, int(150 * ov.get("cue_alpha", 1.0))), 3)
+                         (255, 255, 255, int(150 * _opt(ov, "cue_alpha", 1.0))), 3)
 
         # fan of imagined shots: one straight ray per candidate force to its predicted landing point
         fan = ov.get("fan")
         if fan is not None:
             s = self.px(fan["start"])
-            lock = fan.get("lock", 0.0)
-            order = np.argsort(-np.asarray(fan["costs"]))            # worst first, best on top
+            lock = _opt(fan, "lock", 0.0)
+            order =np.argsort(-np.asarray(fan["costs"]))            # worst first, best on top
             for j in ([] if fan.get("only_chosen") else order):
                 if j >= fan["shown"] or j == fan.get("chosen"):
                     continue
@@ -413,7 +420,7 @@ class DemoRenderer:
         d = ImageDraw.Draw(top)
         # the chosen imagined shot brightens and locks in
         if fan is not None and fan.get("chosen") is not None and fan["chosen"] < fan["shown"]:
-            j, lock = fan["chosen"], fan.get("lock", 0.0)
+            j, lock = fan["chosen"], _opt(fan, "lock", 0.0)
             s, e = self.px(fan["start"]), self.px(fan["ends"][j])
             base = self.cost_color(fan["costs"][j], 255)
             col = tuple(int(base[i] + (255 - base[i]) * lock) for i in range(3))
@@ -423,7 +430,8 @@ class DemoRenderer:
             rr = r_px * (0.5 + 0.8 * lock)
             d.ellipse([e[0] - rr, e[1] - rr, e[0] + rr, e[1] + rr], outline=col + (255,), width=3)
             if lock >= 1.0:
-                pulse = ((self.n - fan.get("lock_frame", self.n)) % 45) / 45
+                # lock_frame is None while the lock-in ramp is still running: the pulse starts now
+                pulse = ((self.n - _opt(fan, "lock_frame", self.n)) % 45) / 45
                 rp = r_px * (1.3 + 1.6 * pulse)
                 d.ellipse([e[0] - rp, e[1] - rp, e[0] + rp, e[1] + rp], outline=(255, 255, 255, int(200 * (1 - pulse))), width=3)
         if ov.get("burst") is not None:
@@ -432,7 +440,7 @@ class DemoRenderer:
             rr = r_px * (1.4 + 3.0 * b)
             d.ellipse([x - rr, y - rr, x + rr, y + rr], outline=(255, 255, 255, int(220 * (1 - b))), width=5)
         if ov.get("cue_est") is not None:
-            ca = ov.get("cue_alpha", 1.0)
+            ca = _opt(ov, "cue_alpha", 1.0)
             x, y = self.px(ov["cue_est"])
             rr = 1.75 * r_px
             col = CYAN + (int(255 * ca),)
@@ -445,7 +453,7 @@ class DemoRenderer:
         # result: markers on the table + card in the label slot
         res = ov.get("result")
         if res is not None:
-            ra = res.get("alpha", 1.0)
+            ra = _opt(res, "alpha", 1.0)
             pp, aa = self.px(res["predicted"]), self.px(res["actual"])
             self._dashed(d, pp, aa, (255, 255, 255, int(160 * ra)), 3, dash=8, gap=6)
             rr = 1.25 * r_px
@@ -470,7 +478,7 @@ class DemoRenderer:
         elif ov.get("stage"):
             a = float(np.clip((self.n - self.stage_start) / 18, 0, 1))
             off = 24 * (1 - a) ** 2
-            tw = max(d.textlength(ov["stage"], font=self.f_title), d.textlength(ov.get("sub", ""), font=self.f_sub))
+            tw = max(d.textlength(ov["stage"], font=self.f_title), d.textlength(_opt(ov, "sub", ""), font=self.f_sub))
             self._panel(d, [32 - off, 30, 32 - off + tw + 56, 30 + 128], a)
             d.text((60 - off, 44), ov["stage"], font=self.f_title, fill=(255, 255, 255, int(255 * a)))
             if ov.get("sub"):
