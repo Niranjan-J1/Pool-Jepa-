@@ -20,6 +20,7 @@ ROBOT_WIDTH = 0.06
 ROBOT_LENGTH = 0.08
 ROBOT_MASS = 0.5
 WHEEL_SEPARATION = ROBOT_WIDTH
+MAX_WHEEL_SPEED = 0.3  # m/s at |pwm| = 1 -> max yaw rate 2 * 0.3 / 0.06 = 10 rad/s
 
 # Ball properties
 BALL_RADIUS = 0.01
@@ -32,9 +33,25 @@ CUSHION_ELASTICITY = 0.7
 CUSHION_FRICTION = 0.3
 LINEAR_DAMPING = 0.97
 ANGULAR_DAMPING = 0.95
+# Rolling resistance of the cloth: constant deceleration on every moving ball. Without it
+# (damping alone keeps 97% of speed per second) balls never come to rest. With 0.5 m/s^2,
+# behind_cue strikes settle in ~1-2 s (median 70 steps, cushions absorb energy too) and the
+# cue ball travels 1-56 cm (median 16 cm).
+ROLLING_DECEL = 0.5  # m/s^2
 
 # Solenoid
 MAX_STRIKE_IMPULSE = 0.05
+
+# "behind_cue" reset: robot front placed behind the cue ball, roughly aimed at it
+SETUP_DISTANCE_RANGE = (0.03, 0.07)       # m, robot front -> cue ball center
+SETUP_AIM_OFFSET_RANGE = (-math.pi / 4, math.pi / 4)  # heading offset from the aim line
+SETUP_MAX_TRIES = 1000
+
+# Rendering. The view spans the table plus a margin; frames are table-shaped (not square).
+# At 432 px across a 0.7204 m view -> 600 px/m -> balls are 12 px across.
+RENDER_WIDTH = 432
+RENDER_HEIGHT = 240
+RENDER_MARGIN = 0.03  # m beyond the table on each side (x); y margin is set by the aspect ratio
 
 # Simulation
 DT = 1 / 60.0
@@ -58,6 +75,8 @@ class SimEnv(BaseEnv):
         self._ball_shapes: dict[str, pymunk.Shape] = {}
         self._fig = None
         self._ax = None
+        self.last_setup: dict = {}
+        self.last_strike_connected = False
 
     def _create_space(self) -> pymunk.Space:
         space = pymunk.Space()
@@ -114,39 +133,114 @@ class SimEnv(BaseEnv):
         hw = TABLE_WIDTH / 2 - margin
         return (random.uniform(-hl, hl), random.uniform(-hw, hw))
 
-    def reset(self) -> Observation:
+    def reset(self, setup: str = "default") -> Observation:
+        """Reset the table.
+
+        setup="default":    robot at a fixed spot, cue ball at the center, targets random.
+        setup="behind_cue": cue ball at a random spot; robot front 3-7 cm behind it along a
+                            random aim line, heading within +/-45 deg of that line; targets
+                            random and non-overlapping.
+        """
         self._space = self._create_space()
         self._ball_bodies.clear()
         self._ball_shapes.clear()
 
         self._add_walls(self._space)
 
-        robot_pos = (-TABLE_LENGTH / 4, 0.0)
-        self._add_robot(self._space, robot_pos, 0.0)
+        if setup == "default":
+            robot_pos, robot_angle = (-TABLE_LENGTH / 4, 0.0), 0.0
+            ball_pos = {"cue": (0.0, 0.0)}
+            for name in ("red", "blue", "yellow"):
+                ball_pos[name] = self._random_table_pos()
+            self.last_setup = {}
+        elif setup == "behind_cue":
+            robot_pos, robot_angle, ball_pos = self._sample_behind_cue_setup()
+        else:
+            raise ValueError(f"Unknown setup: {setup}")
 
-        self._add_ball(self._space, "cue", (0.0, 0.0))
-        self._add_ball(self._space, "red", self._random_table_pos())
-        self._add_ball(self._space, "blue", self._random_table_pos())
-        self._add_ball(self._space, "yellow", self._random_table_pos())
+        self._add_robot(self._space, robot_pos, robot_angle)
+        for name in ("cue", "red", "blue", "yellow"):
+            self._add_ball(self._space, name, ball_pos[name])
 
+        self.last_strike_connected = False
         return self._get_observation()
 
-    def step(self, action: Action) -> Observation:
+    @staticmethod
+    def _robot_corners(pos, angle):
+        c, s = math.cos(angle), math.sin(angle)
+        out = []
+        for lx, ly in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+            px, py = lx * ROBOT_LENGTH / 2, ly * ROBOT_WIDTH / 2
+            out.append((pos[0] + c * px - s * py, pos[1] + s * px + c * py))
+        return out
+
+    @staticmethod
+    def _inside_table(x, y, margin):
+        lim_x = TABLE_LENGTH / 2 - CUSHION_THICKNESS - margin
+        lim_y = TABLE_WIDTH / 2 - CUSHION_THICKNESS - margin
+        return abs(x) <= lim_x and abs(y) <= lim_y
+
+    @staticmethod
+    def _overlaps_robot(pt, pos, angle, clearance):
+        """True if pt lies inside the robot box expanded by clearance."""
+        c, s = math.cos(-angle), math.sin(-angle)
+        dx, dy = pt[0] - pos[0], pt[1] - pos[1]
+        lx, ly = c * dx - s * dy, s * dx + c * dy
+        return abs(lx) <= ROBOT_LENGTH / 2 + clearance and abs(ly) <= ROBOT_WIDTH / 2 + clearance
+
+    def _sample_behind_cue_setup(self):
+        ball_margin = BALL_RADIUS + 0.005
+        for _ in range(SETUP_MAX_TRIES):
+            cue = self._random_table_pos(margin=CUSHION_THICKNESS + ball_margin)
+            aim = random.uniform(-math.pi, math.pi)          # direction robot -> cue
+            dist = random.uniform(*SETUP_DISTANCE_RANGE)     # robot front -> cue center
+            offset = random.uniform(*SETUP_AIM_OFFSET_RANGE)
+            heading = aim + offset
+
+            front = (cue[0] - dist * math.cos(aim), cue[1] - dist * math.sin(aim))
+            pos = (front[0] - ROBOT_LENGTH / 2 * math.cos(heading),
+                   front[1] - ROBOT_LENGTH / 2 * math.sin(heading))
+
+            if not all(self._inside_table(x, y, 0.005) for x, y in self._robot_corners(pos, heading)):
+                continue
+            if self._overlaps_robot(cue, pos, heading, BALL_RADIUS):
+                continue  # large aim offsets at short range can put the cue ball inside the robot
+
+            balls = {"cue": cue}
+            ok = True
+            for name in ("red", "blue", "yellow"):
+                for _ in range(100):
+                    q = self._random_table_pos(margin=CUSHION_THICKNESS + ball_margin)
+                    if self._overlaps_robot(q, pos, heading, BALL_RADIUS + 0.005):
+                        continue
+                    if any(math.hypot(q[0] - b[0], q[1] - b[1]) < 2 * BALL_RADIUS + 0.005
+                           for b in balls.values()):
+                        continue
+                    balls[name] = q
+                    break
+                else:
+                    ok = False
+                    break
+            if not ok:
+                continue
+
+            self.last_setup = {"distance": dist, "aim_offset": offset}
+            return pos, heading, balls
+        raise RuntimeError("Could not sample a valid behind_cue setup")
+
+    def step(self, action: Action, render: bool = True) -> Observation:
+        """Advance one control step (DT). render=False skips drawing the frame (obs["frame"]
+        is None), for fast physics-only rollouts such as letting a shot settle."""
         left_pwm = max(-1.0, min(1.0, action["left_pwm"]))
         right_pwm = max(-1.0, min(1.0, action["right_pwm"]))
 
-        max_wheel_speed = 0.3  # m/s
-        vl = left_pwm * max_wheel_speed
-        vr = right_pwm * max_wheel_speed
-
+        # Differential-drive kinematics: wheel speeds set the body's forward speed and yaw
+        # rate directly (no sideways slip, no coasting; zero PWM = stopped). The velocity
+        # is re-imposed every substep, so the robot pushes balls but is not pushed back.
+        vl = left_pwm * MAX_WHEEL_SPEED
+        vr = right_pwm * MAX_WHEEL_SPEED
         v_linear = (vl + vr) / 2.0
         omega = (vr - vl) / WHEEL_SEPARATION
-
-        angle = self._robot_body.angle
-        fx = v_linear * math.cos(angle) * ROBOT_MASS * 10
-        fy = v_linear * math.sin(angle) * ROBOT_MASS * 10
-        self._robot_body.apply_force_at_local_point((fx, 0), (0, 0))
-        self._robot_body.torque = omega * self._robot_body.moment * 10
 
         if action.get("fire", False):
             force = max(0.0, min(1.0, action.get("fire_force", 0.5)))
@@ -158,16 +252,40 @@ class SimEnv(BaseEnv):
             cue_pos = self._ball_bodies["cue"].position
             dist = math.hypot(cue_pos.x - robot_front.x, cue_pos.y - robot_front.y)
 
-            if dist < ROBOT_LENGTH / 2 + BALL_RADIUS + 0.02:
+            self.last_strike_connected = dist < ROBOT_LENGTH / 2 + BALL_RADIUS + 0.02
+            if self.last_strike_connected:
                 self._ball_bodies["cue"].apply_impulse_at_local_point(impulse, (0, 0))
+        else:
+            self.last_strike_connected = False
 
+        sub_dt = DT / SUBSTEPS
+        rb = self._robot_body
         for _ in range(SUBSTEPS):
-            self._space.step(DT / SUBSTEPS)
+            rb.velocity = (v_linear * math.cos(rb.angle), v_linear * math.sin(rb.angle))
+            rb.angular_velocity = omega
+            self._space.step(sub_dt)
+            self._apply_rolling_resistance(sub_dt)
 
         for body in self._ball_bodies.values():
             body.angular_velocity *= ANGULAR_DAMPING
 
-        return self._get_observation()
+        return self._get_observation(render)
+
+    def _apply_rolling_resistance(self, dt: float):
+        dv = ROLLING_DECEL * dt
+        for body in self._ball_bodies.values():
+            speed = body.velocity.length
+            body.velocity = (0.0, 0.0) if speed <= dv else body.velocity * (1.0 - dv / speed)
+
+    def settle(self, max_steps: int = 600) -> tuple[Observation, int]:
+        """Step with the robot idle (no rendering) until all balls stop or max_steps pass.
+        Returns the final observation (rendered) and the number of steps taken."""
+        idle = Action(left_pwm=0.0, right_pwm=0.0, fire=False, fire_force=0.0)
+        for n in range(1, max_steps + 1):
+            self.step(idle, render=False)
+            if self._balls_settled():
+                break
+        return self._get_observation(), n
 
     def _balls_settled(self) -> bool:
         for body in self._ball_bodies.values():
@@ -176,24 +294,28 @@ class SimEnv(BaseEnv):
                 return False
         return True
 
-    def _get_observation(self) -> Observation:
+    def _get_observation(self, render: bool = True) -> Observation:
         rb = self._robot_body
         ball_positions = [
             (float(b.position.x), float(b.position.y))
             for b in self._ball_bodies.values()
         ]
         return Observation(
-            frame=self.render(),
+            frame=self.render() if render else None,
             robot_pose=(float(rb.position.x), float(rb.position.y), float(rb.angle)),
             ball_positions=ball_positions,
             ball_settled=self._balls_settled(),
         )
 
     def render(self) -> np.ndarray:
-        fig, ax = plt.subplots(1, 1, figsize=(2, 2), dpi=64)
-        ax.set_xlim(-TABLE_LENGTH / 2 - 0.03, TABLE_LENGTH / 2 + 0.03)
-        ax.set_ylim(-TABLE_WIDTH / 2 - 0.03, TABLE_WIDTH / 2 + 0.03)
-        ax.set_aspect("equal")
+        """Return a (RENDER_HEIGHT, RENDER_WIDTH, 3) uint8 frame at a uniform px/m scale."""
+        dpi = 100
+        fig = plt.figure(figsize=(RENDER_WIDTH / dpi, RENDER_HEIGHT / dpi), dpi=dpi)
+        ax = fig.add_axes([0, 0, 1, 1])
+        half_w = TABLE_LENGTH / 2 + RENDER_MARGIN
+        half_h = half_w * RENDER_HEIGHT / RENDER_WIDTH
+        ax.set_xlim(-half_w, half_w)
+        ax.set_ylim(-half_h, half_h)
         ax.set_facecolor("#1a5c2a")
         ax.axis("off")
         fig.patch.set_facecolor("#1a5c2a")
@@ -265,17 +387,12 @@ class SimEnv(BaseEnv):
             linewidth=1.5,
         )
 
-        fig.tight_layout(pad=0)
         fig.canvas.draw()
-
         buf = fig.canvas.buffer_rgba()
         img = np.asarray(buf)[:, :, :3].copy()
         plt.close(fig)
-
-        from PIL import Image
-        pil_img = Image.fromarray(img)
-        pil_img = pil_img.resize((128, 128), Image.LANCZOS)
-        return np.array(pil_img, dtype=np.uint8)
+        assert img.shape == (RENDER_HEIGHT, RENDER_WIDTH, 3), img.shape
+        return img
 
 
 if __name__ == "__main__":

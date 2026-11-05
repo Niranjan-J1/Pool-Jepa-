@@ -37,3 +37,5 @@ runs/
 .ipynb_checkpoints/
 # Scratch renders
 test_render.png
+# Recorded shot videos (planning/record_shot.py)
+videos/

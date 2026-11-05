@@ -12,7 +12,7 @@ class Action(TypedDict):
 
 
 class Observation(TypedDict):
-    frame: np.ndarray              # 128x128x3 uint8
+    frame: np.ndarray              # HxWx3 uint8 (sim: 240x432, see sim_env.RENDER_*)
     robot_pose: tuple[float, float, float]  # (x, y, theta)
     ball_positions: list[tuple[float, float]]  # [(x, y), ...]
     ball_settled: bool
@@ -31,5 +31,5 @@ class BaseEnv(ABC):
 
     @abstractmethod
     def render(self) -> np.ndarray:
-        """Return the current frame as a 128x128x3 uint8 numpy array."""
+        """Return the current frame as an HxWx3 uint8 numpy array."""
         ...
