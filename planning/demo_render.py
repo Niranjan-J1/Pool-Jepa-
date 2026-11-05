@@ -1,17 +1,21 @@
 """Polished 2-D renderer for demo clips (record_shot.py). Presentation only.
 
-Perception never sees these frames: the encoder still reads the plain 432x240 env.render()
-frames it was trained on (record_shot.py shows those as an inset). This module only draws the
-same simulator state more nicely at 1920x1080:
-  - felt with a soft spotlight, cushion shadow, grain and vignette; wood rails with grain,
-    bevel and sights; decorative corner pockets (the simulated table has none);
-  - balls shaded as spheres (diffuse + specular) with soft drop shadows;
-  - a robot sprite (wheels, top plate, marker, orange nose and striker) with a shadow;
-  - a fading trail behind the moving cue ball;
-  - overlays: target crosshair, perceived-cue ring, aim line, imagined landing points,
-    stage labels that fade in, and a result card.
-A frame is drawn from a state dict {"robot": (x, y, theta), "balls": (4, 2) array in the
-order cue, red, blue, yellow} and an overlay dict (keys documented in DemoRenderer.frame).
+Perception never sees these frames: the encoder reads the plain 432x240 env.render() frames it
+was trained on, and the clip shows exactly that input in a camera inset. This module draws the
+same simulator state at 1920x1080:
+  - felt with spotlight, cushion shadow, nap and vignette; wood rails with grain, bevel and
+    sights; decorative corner pockets (the simulated table has none);
+  - balls shaded as spheres with drop shadows; a robot sprite with an orange nose and striker;
+    a fading trail behind the moving cue ball;
+  - overlays: target crosshair, perceived-cue reticle, aim line, the fan of imagined shots
+    (one straight ray per candidate force, from the cue ball to the landing point the shot
+    model predicts; the model predicts landing points, not paths, and every candidate is fired
+    along the same heading), stage labels that fade in, and a result card;
+  - the camera inset: the encoder's input (camera frame minus the empty-table background,
+    rescaled from [-1, 1] to grey levels) with the encoder's learned keypoints on it (cue-ball
+    keypoints highlighted) and the decoded cue-ball position.
+Layout: the band above the table holds the stage label / result card (left) and the inset
+(right); nothing is drawn over the playing surface except the in-world overlays.
 """
 import math
 from collections import deque
@@ -19,8 +23,8 @@ from collections import deque
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from env.sim_env import (BALL_COLORS, BALL_RADIUS, CUSHION_THICKNESS, ROBOT_LENGTH, ROBOT_WIDTH,
-                         TABLE_LENGTH, TABLE_WIDTH)
+from env.sim_env import (BALL_COLORS, BALL_RADIUS, CUSHION_THICKNESS, RENDER_HEIGHT, RENDER_MARGIN,
+                         RENDER_WIDTH, ROBOT_LENGTH, ROBOT_WIDTH, TABLE_LENGTH, TABLE_WIDTH)
 
 W, H = 1920, 1080
 INNER_X = TABLE_LENGTH / 2 - CUSHION_THICKNESS   # cushion faces = where balls bounce
@@ -30,9 +34,11 @@ RAIL = 0.052     # m from the face to the outer edge of the wood
 SS = 3           # supersampling for sprites
 BALL_NAMES = ["cue", "red", "blue", "yellow"]
 TRAIL_FRAMES = 40
+TABLE_TOP = 390  # px; the band above holds labels and the camera inset
 GOLD = (255, 205, 60)
 CYAN = (70, 225, 255)
 MAGENTA = (255, 80, 200)
+ENC_STRIDE = 8   # encoder feature map = image / 8 (three stride-2 convs)
 
 
 def _font(size, bold=False):
@@ -49,9 +55,7 @@ def _font(size, bold=False):
 
 
 def _resize(a, size):
-    """float array -> resized float array via PIL (bicubic)."""
-    img = Image.fromarray(a.astype(np.float32), mode="F").resize(size, Image.BICUBIC)
-    return np.asarray(img)
+    return np.asarray(Image.fromarray(a.astype(np.float32), mode="F").resize(size, Image.BICUBIC))
 
 
 def lerp_state(a, b, t):
@@ -61,32 +65,49 @@ def lerp_state(a, b, t):
 
 
 def interpolate(states, slowmo):
-    """Physics states (one per 60 Hz step) -> one state per output frame, `slowmo` frames per
-    step, linearly interpolated between steps."""
+    """Physics states (one per 60 Hz step) -> (state, index of the nearest physics step) per
+    output frame, `slowmo` frames per step, linearly interpolated between steps."""
     if slowmo <= 1.0 or len(states) < 2:
-        return list(states)
+        return [(s, i) for i, s in enumerate(states)]
     out, n = [], len(states) - 1
     for j in range(int(n * slowmo) + 1):
         t = j / slowmo
         i = min(int(t), n - 1)
-        out.append(lerp_state(states[i], states[i + 1], t - i))
+        out.append((lerp_state(states[i], states[i + 1], t - i), int(round(t))))
     return out
+
+
+def world_to_cam(xy):
+    """Metres -> pixel in the 432x240 sim camera frame."""
+    hw = TABLE_LENGTH / 2 + RENDER_MARGIN
+    hh = hw * RENDER_HEIGHT / RENDER_WIDTH
+    return ((xy[0] + hw) / (2 * hw) * RENDER_WIDTH, (hh - xy[1]) / (2 * hh) * RENDER_HEIGHT)
+
+
+def keypoint_to_cam(kp):
+    """Spatial-softmax keypoint in [-1, 1] feature-map coordinates -> camera pixel."""
+    fw, fh = RENDER_WIDTH // ENC_STRIDE, RENDER_HEIGHT // ENC_STRIDE
+    return ((kp[0] + 1) / 2 * (fw - 1) * ENC_STRIDE + ENC_STRIDE / 2 - 0.5,
+            (kp[1] + 1) / 2 * (fh - 1) * ENC_STRIDE + ENC_STRIDE / 2 - 0.5)
 
 
 class DemoRenderer:
     def __init__(self, pockets=True, seed=0):
-        # Table fills y 260..1020; the band above holds the stage label, encoder inset and result
-        # card, the strip below the HUD text, so nothing is drawn over the playing surface.
-        self.S = min(1700 / (2 * (INNER_X + RAIL)), 760 / (2 * (INNER_Y + RAIL)))  # px per m
-        self.cx, self.cy = W / 2, 260 + (INNER_Y + RAIL) * self.S
+        self.S = min(1700 / (2 * (INNER_X + RAIL)), (1030 - TABLE_TOP) / (2 * (INNER_Y + RAIL)))
+        self.cx, self.cy = W / 2, TABLE_TOP + (INNER_Y + RAIL) * self.S
         self.rng = np.random.default_rng(seed)
-        self.bg = self._background(pockets)
+        self.backdrop, self.bg = self._background(pockets)
         self.balls = {n: self._ball_sprite(BALL_COLORS[n]) for n in BALL_NAMES}
         self.ball_shadow = self._shadow_sprite(BALL_RADIUS * 2, BALL_RADIUS * 2, round_frac=1.0)
         self.robot = self._robot_sprite()
         self.robot_shadow = self._shadow_sprite(ROBOT_LENGTH, ROBOT_WIDTH, round_frac=0.25)
         self.f_title, self.f_sub = _font(54, True), _font(26)
-        self.f_small, self.f_card, self.f_big = _font(22), _font(28), _font(60, True)
+        self.f_small, self.f_cap = _font(22), _font(26, True)
+        self.f_huge, self.f_card = _font(84, True), _font(34)
+        self.reset()
+
+    def reset(self):
+        """Forget the trail and the current stage (call between shots)."""
         self.trail = deque()
         self.stage, self.stage_start, self.n = None, 0, 0
 
@@ -103,15 +124,17 @@ class DemoRenderer:
         wx, wy = (xx - self.cx) / self.S, (self.cy - yy) / self.S
         ax, ay = np.abs(wx), np.abs(wy)
 
-        # backdrop: dark slate with a soft radial falloff
         r = np.hypot((xx - W / 2) / (W / 2), (yy - H / 2) / (H / 2))
         img = np.array([30, 34, 41], np.float32) * (1.08 - 0.5 * np.clip(r / 1.4, 0, 1))[..., None]
+        backdrop = Image.fromarray(np.clip(img * (1 - 0.28 * np.clip(r - 0.55, 0, 1))[..., None], 0, 255)
+                                   .astype(np.uint8), "RGB").convert("RGBA")
 
-        # table drop shadow
         bx, by, rc = INNER_X + RAIL, INNER_Y + RAIL, 0.03
+
         def rounded(px_, py_, hx, hy, rad):
             qx, qy = np.maximum(px_ - (hx - rad), 0), np.maximum(py_ - (hy - rad), 0)
             return np.hypot(qx, qy) - rad   # <= 0 inside
+
         sh = Image.fromarray((rounded(np.abs(wx - 0.006), np.abs(wy + 0.012), bx, by, rc) <= 0)
                              .astype(np.uint8) * 255).filter(ImageFilter.GaussianBlur(28))
         img *= (1 - 0.6 * np.asarray(sh, np.float32) / 255)[..., None]
@@ -128,19 +151,19 @@ class DemoRenderer:
         grain = np.where(horiz, g_h, g_v)
         fine = _resize(self.rng.random((H // 2, W // 2)), (W, H))
         wood_col = np.array([118, 66, 33], np.float32) * (0.72 + 0.28 * grain + 0.06 * fine)[..., None]
-        d_out = -rounded(ax, ay, bx, by, rc)                          # m inside the outer edge
+        d_out = -rounded(ax, ay, bx, by, rc)
         d_in = np.minimum(np.abs(ay - INNER_Y - CUSH) * horiz + 9 * ~horiz,
                           np.abs(ax - INNER_X - CUSH) * ~horiz + 9 * horiz)
-        bevel = 1 + 0.35 * np.exp(-d_out / 0.0025) - 0.35 * np.exp(-d_in / 0.004)
+        bevel = 1 + 0.35 * np.exp(-np.clip(d_out, 0, None) / 0.0025) - 0.35 * np.exp(-np.clip(d_in, 0, None) / 0.004)
         light = 1 + 0.07 * wy / (INNER_Y + RAIL)
         img = np.where(wood[..., None], wood_col * (bevel * light)[..., None], img)
 
-        # cushions: darker green, lit toward the top ridge
+        # cushions
         t = np.clip(np.maximum(ax - INNER_X, ay - INNER_Y) / CUSH, 0, 1)
         cush_col = np.array([18, 86, 50], np.float32) * (0.7 + 0.45 * np.sin(np.pi * (0.25 + 0.6 * t)))[..., None]
         img = np.where(cush[..., None], cush_col, img)
 
-        # felt: spotlight, cushion shadow, vignette, fine nap
+        # felt
         spot = np.exp(-((wx / 0.42) ** 2 + (wy / 0.24) ** 2))
         edge = np.minimum(INNER_X - ax, INNER_Y - ay)
         shade = (0.80 + 0.30 * spot) * (1 - 0.38 * np.exp(-np.clip(edge, 0, None) / 0.007))
@@ -148,35 +171,28 @@ class DemoRenderer:
         felt_col = np.array([24, 112, 64], np.float32) * (shade * nap)[..., None]
         img = np.where(felt[..., None], felt_col, img)
 
-        # sights (diamonds) on the rails
+        # sights
         mid = INNER_X + CUSH + (RAIL - CUSH) * 0.45
         midy = INNER_Y + CUSH + (RAIL - CUSH) * 0.45
         sights = [(INNER_X * k / 4, s * midy) for k in (-3, -2, -1, 1, 2, 3) for s in (-1, 1)] + \
                  [(s * mid, INNER_Y * k / 2) for k in (-1, 0, 1) for s in (-1, 1)]
         for sx, sy in sights:
-            d = np.hypot(wx - sx, wy - sy)
-            a = np.clip((0.0034 - d) / 0.0008, 0, 1)
+            a = np.clip((0.0034 - np.hypot(wx - sx, wy - sy)) / 0.0008, 0, 1)
             img = img * (1 - a[..., None]) + np.array([236, 226, 200], np.float32) * a[..., None]
 
-        # decorative corner pockets
+        # decorative corner pockets, centred in the cushion corner so they barely reach the felt
         if pockets:
             for sx in (-1, 1):
                 for sy in (-1, 1):
-                    # centred in the cushion corner so they barely reach into the playing area
-                    # (a ball at the corner never looks half-pocketed)
-                    px_, py_ = sx * (INNER_X + 0.011), sy * (INNER_Y + 0.011)
-                    d = np.hypot(wx - px_, wy - py_)
+                    d = np.hypot(wx - sx * (INNER_X + 0.011), wy - sy * (INNER_Y + 0.011))
                     rim = np.clip((0.021 - d) / 0.0012, 0, 1)
                     img = img * (1 - rim[..., None]) + np.array([46, 30, 22], np.float32) * rim[..., None]
                     hole = np.clip((0.0165 - d) / 0.0012, 0, 1)
-                    depth = np.clip(d / 0.0165, 0, 1)
-                    hole_col = np.array([8, 8, 9], np.float32) * (0.5 + 1.5 * depth)[..., None]
+                    hole_col = np.array([8, 8, 9], np.float32) * (0.5 + 1.5 * np.clip(d / 0.0165, 0, 1))[..., None]
                     img = img * (1 - hole[..., None]) + hole_col * hole[..., None]
 
-        # vignette over everything
         img *= (1 - 0.28 * np.clip(r - 0.55, 0, 1))[..., None]
-        out = np.clip(img, 0, 255).astype(np.uint8)
-        return Image.fromarray(out, "RGB").convert("RGBA")
+        return backdrop, Image.fromarray(np.clip(img, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
 
     def _ball_sprite(self, color):
         r = self.m(BALL_RADIUS)
@@ -184,14 +200,14 @@ class DemoRenderer:
         big = n * SS
         yy, xx = np.mgrid[0:big, 0:big].astype(np.float32) + 0.5
         R, c = r * SS, big / 2
-        dx, dy = (xx - c) / R, (yy - c) / R                      # image y points down
+        dx, dy = (xx - c) / R, (yy - c) / R
         d2 = dx * dx + dy * dy
         nz = np.sqrt(np.clip(1 - d2, 0, 1))
         L = np.array([-0.42, -0.58, 0.70]); L /= np.linalg.norm(L)
         Hv = L + np.array([0, 0, 1.0]); Hv /= np.linalg.norm(Hv)
         diff = np.clip(dx * L[0] + dy * L[1] + nz * L[2], 0, 1)
         spec = np.clip(dx * Hv[0] + dy * Hv[1] + nz * Hv[2], 0, 1) ** 70
-        bounce = np.clip(dy, 0, 1) * 0.12                          # light from the felt below
+        bounce = np.clip(dy, 0, 1) * 0.12
         base = np.array(color, np.float32) * 255
         rgb = base * (0.22 + 0.86 * diff + bounce)[..., None] * (0.82 + 0.18 * nz)[..., None]
         rgb = rgb + 255 * 0.9 * spec[..., None]
@@ -205,61 +221,50 @@ class DemoRenderer:
         img = Image.new("L", (w, h), 0)
         rad = round_frac * min(self.m(lx), self.m(ly)) / 2
         ImageDraw.Draw(img).rounded_rectangle([pad, pad, w - pad, h - pad], radius=rad, fill=120)
-        img = img.filter(ImageFilter.GaussianBlur(7))
         out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        out.putalpha(img)
+        out.putalpha(img.filter(ImageFilter.GaussianBlur(7)))
         return out
 
     def _robot_sprite(self):
-        s = self.S * SS
-        L, Wd = ROBOT_LENGTH * s, ROBOT_WIDTH * s
-        pad = int(0.006 * s)
+        u = self.S * SS                       # px per m, supersampled
+        L, Wd = ROBOT_LENGTH * u, ROBOT_WIDTH * u
+        pad = int(0.006 * u)
         img = Image.new("RGBA", (int(L) + 2 * pad, int(Wd) + 2 * pad), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         x0, y0 = pad, pad
-        u = s  # px per m (supersampled)
-        # wheels (inside the footprint, along both sides)
-        for side in (0, 1):
+        for side in (0, 1):                   # wheels, inside the footprint
             wy0 = y0 + (0 if side == 0 else Wd - 0.011 * u)
             d.rounded_rectangle([x0 + 0.018 * u, wy0, x0 + L - 0.018 * u, wy0 + 0.011 * u],
                                 radius=0.003 * u, fill=(22, 22, 25, 255))
-            for k in range(9):   # tread lines
+            for k in range(9):
                 tx = x0 + 0.020 * u + k * (L - 0.040 * u) / 8
                 d.line([tx, wy0 + 0.001 * u, tx, wy0 + 0.010 * u], fill=(48, 48, 54, 255), width=max(1, int(0.0008 * u)))
-        # chassis
         d.rounded_rectangle([x0, y0 + 0.008 * u, x0 + L, y0 + Wd - 0.008 * u], radius=0.010 * u,
                             fill=(46, 50, 58, 255), outline=(20, 22, 26, 255), width=int(0.0012 * u))
-        # top plate
         d.rounded_rectangle([x0 + 0.008 * u, y0 + 0.013 * u, x0 + L - 0.016 * u, y0 + Wd - 0.013 * u],
                             radius=0.007 * u, fill=(84, 92, 106, 255))
         d.rounded_rectangle([x0 + 0.010 * u, y0 + 0.015 * u, x0 + L - 0.018 * u, y0 + 0.020 * u],
-                            radius=0.002 * u, fill=(120, 130, 146, 255))   # plate highlight
-        # tracking marker on the back half
-        mx, my, ms = x0 + 0.014 * u, y0 + Wd / 2 - 0.009 * u, 0.018 * u
+                            radius=0.002 * u, fill=(120, 130, 146, 255))
+        mx, my, ms = x0 + 0.014 * u, y0 + Wd / 2 - 0.009 * u, 0.018 * u     # tracking marker
         d.rectangle([mx, my, mx + ms, my + ms], fill=(245, 245, 245, 255))
         cell = ms / 4
-        pattern = [(1, 1), (2, 1), (1, 2), (2, 2), (0, 3), (3, 0)]
         d.rectangle([mx + cell * 0.5, my + cell * 0.5, mx + ms - cell * 0.5, my + ms - cell * 0.5], fill=(20, 20, 20, 255))
-        for i, j in pattern[:4]:
-            if (i + j) % 2 == 0:
-                d.rectangle([mx + i * cell, my + j * cell, mx + (i + 1) * cell - 1, my + (j + 1) * cell - 1],
-                            fill=(245, 245, 245, 255))
-        # nose: orange chevron pointing forward (+x), and the striker at the front edge
-        nx = x0 + L - 0.014 * u
-        cy = y0 + Wd / 2
+        for i, j in ((1, 1), (2, 2)):
+            d.rectangle([mx + i * cell, my + j * cell, mx + (i + 1) * cell - 1, my + (j + 1) * cell - 1], fill=(245, 245, 245, 255))
+        nx, cy = x0 + L - 0.014 * u, y0 + Wd / 2                              # nose + striker
         d.polygon([(nx - 0.016 * u, cy - 0.012 * u), (nx, cy), (nx - 0.016 * u, cy + 0.012 * u),
                    (nx - 0.010 * u, cy)], fill=(255, 140, 36, 255))
         d.rectangle([x0 + L - 0.010 * u, cy - 0.004 * u, x0 + L + 0.001 * u, cy + 0.004 * u],
                     fill=(196, 200, 208, 255), outline=(90, 94, 102, 255))
-        n = (img.width // SS, img.height // SS)
-        return img.resize(n, Image.LANCZOS)
+        return img.resize((img.width // SS, img.height // SS), Image.LANCZOS)
 
-    # ---------------------------------------------------------------- per frame
+    # ---------------------------------------------------------------- helpers
     def _paste_center(self, canvas, sprite, xy, dx=0, dy=0):
         x, y = self.px(xy)
         canvas.alpha_composite(sprite, (int(round(x - sprite.width / 2 + dx)), int(round(y - sprite.height / 2 + dy))))
 
-    def _rot(self, sprite, theta):
+    @staticmethod
+    def _rot(sprite, theta):
         return sprite.rotate(math.degrees(theta), resample=Image.BICUBIC, expand=True)
 
     @staticmethod
@@ -275,7 +280,7 @@ class DemoRenderer:
             t = e + gap
 
     @staticmethod
-    def _cost_color(cost, alpha=235):
+    def cost_color(cost, alpha=235):
         t = float(np.clip(cost / 0.08, 0, 1))      # 0 cm green -> 4 cm yellow -> >= 8 cm red
         if t < 0.5:
             k = t / 0.5
@@ -283,17 +288,67 @@ class DemoRenderer:
         else:
             k = (t - 0.5) / 0.5
             c = (250 - 10 * k, 210 - 140 * k, 60)
-        return tuple(int(v) for v in c) + (alpha,)
+        return tuple(int(v) for v in c) + (int(alpha),)
 
-    def _panel(self, d, box, alpha=1.0):
-        d.rounded_rectangle(box, radius=14, fill=(12, 14, 18, int(175 * alpha)),
+    @staticmethod
+    def _panel(d, box, alpha=1.0):
+        d.rounded_rectangle(box, radius=14, fill=(12, 14, 18, int(180 * alpha)),
                             outline=(255, 255, 255, int(40 * alpha)), width=2)
 
+    def _inset(self, top, d, ins):
+        """Camera inset (top right): the encoder input with its keypoints."""
+        cam = Image.fromarray(ins["image"]).convert("RGBA")          # 432x240, encoder resolution
+        scale = 1.0
+        kd = ImageDraw.Draw(cam)
+        for k, kp in enumerate(ins["kps"]):
+            x, y = keypoint_to_cam(kp)
+            if ins["cue_sel"][k]:
+                kd.ellipse([x - 3.5, y - 3.5, x + 3.5, y + 3.5], fill=CYAN + (255,), outline=(0, 0, 0, 255))
+            else:
+                kd.ellipse([x - 2.2, y - 2.2, x + 2.2, y + 2.2], fill=(255, 255, 255, 150))
+        if ins.get("cue") is not None:
+            x, y = world_to_cam(ins["cue"])
+            kd.ellipse([x - 10, y - 10, x + 10, y + 10], outline=CYAN + (255,), width=2)
+        iw, ih = int(cam.width * scale), int(cam.height * scale)
+        cap1 = "what the AI sees (raw camera)"
+        cap2 = "camera minus the empty table = encoder input"
+        cap3 = "dots: learned keypoints  ·  cyan: cue ball"
+        bw = max(iw, d.textlength(cap2, font=self.f_small), d.textlength(cap3, font=self.f_small))
+        x0, y0 = W - bw - 40, 26
+        d.rounded_rectangle([x0 - 12, y0 - 12, x0 + bw + 12, y0 + ih + 104], radius=12, fill=(12, 14, 18, 215),
+                            outline=(255, 255, 255, 40), width=2)
+        top.alpha_composite(cam, (int(x0 + (bw - iw) / 2), y0))
+        d.ellipse([x0, y0 + ih + 16, x0 + 12, y0 + ih + 28], fill=(235, 60, 60, 255))   # "live" dot
+        d.text((x0 + 20, y0 + ih + 8), cap1, font=self.f_cap, fill=(255, 255, 255, 255))
+        d.text((x0, y0 + ih + 44), cap2, font=self.f_small, fill=(205, 212, 222, 230))
+        d.text((x0, y0 + ih + 70), cap3, font=self.f_small, fill=(205, 212, 222, 230))
+
+    # ---------------------------------------------------------------- frames
+    def card(self, title, sub="", alpha=1.0, note=""):
+        """Full-frame title card (montage)."""
+        img = self.backdrop.copy()
+        top = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(top)
+        a = int(255 * alpha)
+        tw = d.textlength(title, font=self.f_huge)
+        d.text((W / 2 - tw / 2, H / 2 - 110), title, font=self.f_huge, fill=(255, 255, 255, a))
+        if sub:
+            sw = d.textlength(sub, font=self.f_card)
+            d.text((W / 2 - sw / 2, H / 2 + 10), sub, font=self.f_card, fill=(210, 216, 226, a))
+        if note:
+            nw = d.textlength(note, font=self.f_small)
+            d.text((W / 2 - nw / 2, H / 2 + 80), note, font=self.f_small, fill=(170, 178, 190, a))
+        wm = "Pool-JEPA  ·  simulation"
+        d.text((W - d.textlength(wm, font=self.f_small) - 40, H - 46), wm, font=self.f_small, fill=(255, 255, 255, 110))
+        img.alpha_composite(top)
+        return np.asarray(img.convert("RGB"))
+
     def frame(self, state, ov):
-        """state: {"robot": (x, y, th), "balls": (4, 2)}. ov keys (all optional except stage):
-        stage, sub: label text; target: xy; target_alpha; cue_est: xy; cue_alpha; aim_line: bool;
-        candidates: (points (N, 2), costs (N,)); chosen: xy; chosen_text; trail: bool (cue ball
-        leaves a trail this frame); burst: 0..1 strike flash; hud: str; inset: (h, w, 3) image;
+        """state: {"robot": (x, y, th), "balls": (4, 2)}. ov keys (all optional):
+        stage, sub: label text; target: xy; target_alpha; cue_est: xy; cue_alpha; aim_line;
+        fan: dict(start, ends (N, 2), costs (N,), shown (int), chosen (int), lock (0..1),
+             only_chosen (bool: draw just the chosen ray));
+        trail: bool; burst: 0..1; inset: dict(image, kps, cue_sel, cue);
         result: dict(predicted, actual, miss, travel, force, n_forces, alpha)."""
         self.n += 1
         if ov.get("stage") != self.stage:
@@ -312,35 +367,37 @@ class DemoRenderer:
         pts = list(self.trail)
         for (p0, n0), (p1, _) in zip(pts, pts[1:]):
             age = (self.n - n0) / TRAIL_FRAMES
-            a = int(170 * (1 - age) ** 1.6)
-            w = max(1, int(r_px * 1.5 * (1 - age) + 1))
-            d.line([self.px(p0), self.px(p1)], fill=(235, 245, 255, a), width=w)
+            d.line([self.px(p0), self.px(p1)], fill=(235, 245, 255, int(170 * (1 - age) ** 1.6)),
+                   width=max(1, int(r_px * 1.5 * (1 - age) + 1)))
 
-        # target crosshair (on the felt, under the balls)
+        # target crosshair
         if ov.get("target") is not None:
             ta = ov.get("target_alpha", 1.0)
             tx, ty = self.px(ov["target"])
-            pulse = 1 + 0.10 * math.sin(2 * math.pi * self.n / 70)
-            rr = 2.1 * r_px * pulse
+            rr = 2.1 * r_px * (1 + 0.10 * math.sin(2 * math.pi * self.n / 70))
             col = GOLD + (int(255 * ta),)
             d.ellipse([tx - rr, ty - rr, tx + rr, ty + rr], outline=col, width=4)
             d.ellipse([tx - 4, ty - 4, tx + 4, ty + 4], fill=col)
             for sx, sy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 d.line([tx + sx * rr * 0.55, ty + sy * rr * 0.55, tx + sx * rr * 1.5, ty + sy * rr * 1.5], fill=col, width=4)
 
-        # aim line from the perceived cue ball to the target
         if ov.get("aim_line") and ov.get("cue_est") is not None:
             self._dashed(d, self.px(ov["cue_est"]), self.px(ov["target"]),
                          (255, 255, 255, int(150 * ov.get("cue_alpha", 1.0))), 3)
 
-        # imagined landing points
-        if ov.get("candidates") is not None:
-            cp, cc = ov["candidates"]
-            for p, c in zip(cp, cc):
-                x, y = self.px(p)
-                rr = 0.42 * r_px
-                d.ellipse([x - rr * 1.9, y - rr * 1.9, x + rr * 1.9, y + rr * 1.9], fill=self._cost_color(c, 45))
-                d.ellipse([x - rr, y - rr, x + rr, y + rr], fill=self._cost_color(c))
+        # fan of imagined shots: one straight ray per candidate force to its predicted landing point
+        fan = ov.get("fan")
+        if fan is not None:
+            s = self.px(fan["start"])
+            lock = fan.get("lock", 0.0)
+            order = np.argsort(-np.asarray(fan["costs"]))            # worst first, best on top
+            for j in ([] if fan.get("only_chosen") else order):
+                if j >= fan["shown"] or j == fan.get("chosen"):
+                    continue
+                e = self.px(fan["ends"][j])
+                a = 95 * (1 - 0.6 * lock)
+                d.line([s, e], fill=self.cost_color(fan["costs"][j], a), width=2)
+                d.ellipse([e[0] - 4, e[1] - 4, e[0] + 4, e[1] + 4], fill=self.cost_color(fan["costs"][j], 2 * a))
         img.alpha_composite(layer)
 
         # shadows, balls, robot
@@ -354,33 +411,38 @@ class DemoRenderer:
 
         top = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         d = ImageDraw.Draw(top)
-        # strike flash
+        # the chosen imagined shot brightens and locks in
+        if fan is not None and fan.get("chosen") is not None and fan["chosen"] < fan["shown"]:
+            j, lock = fan["chosen"], fan.get("lock", 0.0)
+            s, e = self.px(fan["start"]), self.px(fan["ends"][j])
+            base = self.cost_color(fan["costs"][j], 255)
+            col = tuple(int(base[i] + (255 - base[i]) * lock) for i in range(3))
+            if lock > 0:
+                d.line([s, e], fill=col + (int(70 * lock),), width=int(4 + 14 * lock))   # glow
+            d.line([s, e], fill=col + (int(110 + 145 * max(lock, 0.0)),), width=int(2 + 3 * lock))
+            rr = r_px * (0.5 + 0.8 * lock)
+            d.ellipse([e[0] - rr, e[1] - rr, e[0] + rr, e[1] + rr], outline=col + (255,), width=3)
+            if lock >= 1.0:
+                pulse = ((self.n - fan.get("lock_frame", self.n)) % 45) / 45
+                rp = r_px * (1.3 + 1.6 * pulse)
+                d.ellipse([e[0] - rp, e[1] - rp, e[0] + rp, e[1] + rp], outline=(255, 255, 255, int(200 * (1 - pulse))), width=3)
         if ov.get("burst") is not None:
             b = ov["burst"]
             x, y = self.px(balls[0])
             rr = r_px * (1.4 + 3.0 * b)
             d.ellipse([x - rr, y - rr, x + rr, y + rr], outline=(255, 255, 255, int(220 * (1 - b))), width=5)
-        # perceived cue ring
         if ov.get("cue_est") is not None:
             ca = ov.get("cue_alpha", 1.0)
             x, y = self.px(ov["cue_est"])
             rr = 1.75 * r_px
-            d.ellipse([x - rr, y - rr, x + rr, y + rr], outline=CYAN + (int(255 * ca),), width=4)
-            for k in range(4):   # corner ticks: a "detection" reticle
+            col = CYAN + (int(255 * ca),)
+            d.ellipse([x - rr, y - rr, x + rr, y + rr], outline=col, width=4)
+            for k in range(4):
                 a0 = math.radians(45 + 90 * k)
                 d.line([x + rr * 1.15 * math.cos(a0), y + rr * 1.15 * math.sin(a0),
-                        x + rr * 1.55 * math.cos(a0), y + rr * 1.55 * math.sin(a0)], fill=CYAN + (int(255 * ca),), width=4)
-            d.text((x + rr * 1.6, y - rr * 1.9), "perceived", font=self.f_small, fill=CYAN + (int(230 * ca),))
-        # chosen imagined landing point
-        if ov.get("chosen") is not None:
-            x, y = self.px(ov["chosen"])
-            rr = 1.25 * r_px
-            d.ellipse([x - rr * 1.6, y - rr * 1.6, x + rr * 1.6, y + rr * 1.6], outline=(255, 255, 255, 80), width=8)
-            d.ellipse([x - rr, y - rr, x + rr, y + rr], outline=(255, 255, 255, 255), width=4)
-            if ov.get("chosen_text"):
-                d.text((x + rr * 1.8, y + rr * 0.6), ov["chosen_text"], font=self.f_small, fill=(255, 255, 255, 240))
+                        x + rr * 1.55 * math.cos(a0), y + rr * 1.55 * math.sin(a0)], fill=col, width=4)
 
-        # result markers + card
+        # result: markers on the table + card in the label slot
         res = ov.get("result")
         if res is not None:
             ra = res.get("alpha", 1.0)
@@ -391,37 +453,21 @@ class DemoRenderer:
             rr = 1.6 * r_px
             d.ellipse([aa[0] - rr, aa[1] - rr, aa[0] + rr, aa[1] + rr], outline=MAGENTA + (int(255 * ra),), width=5)
             title = f"Landed {100 * res['miss']:.1f} cm from the target"
-            sub = (f"target {100 * res['travel']:.1f} cm away  ·  force {res['force']:.2f}, best of "
+            sub = (f"target {100 * res['travel']:.1f} cm away  ·  strength {res['force']:.2f}, best of "
                    f"{res['n_forces']} imagined shots")
             text_w = max(d.textlength(title, font=self.f_title), d.textlength(sub, font=self.f_sub))
-            legend_w = 20 + 34 + d.textlength("imagined landing", font=self.f_small)
-            bw, bh = text_w + legend_w + 34 + 60 + 34, 150
-            box = [W / 2 - bw / 2, 50, W / 2 + bw / 2, 50 + bh]
+            legend_w = 54 + d.textlength("imagined landing", font=self.f_small)
+            box = [32, 30, 32 + 34 + text_w + 40 + legend_w + 24, 30 + 210]
             self._panel(d, box, ra)
-            d.text((box[0] + 34, box[1] + 22), title, font=self.f_title, fill=(255, 255, 255, int(255 * ra)))
-            d.text((box[0] + 36, box[1] + 96), sub, font=self.f_sub, fill=(220, 225, 232, int(255 * ra)))
-            d.line([box[0] + 34 + text_w + 30, box[1] + 24, box[0] + 34 + text_w + 30, box[3] - 24],
-                   fill=(255, 255, 255, int(50 * ra)), width=2)
-            lx = box[0] + 34 + text_w + 60
-            d.ellipse([lx, box[1] + 30, lx + 22, box[1] + 52], outline=(255, 255, 255, int(255 * ra)), width=3)
-            d.text((lx + 34, box[1] + 26), "imagined landing", font=self.f_small, fill=(255, 255, 255, int(230 * ra)))
-            d.ellipse([lx, box[1] + 66, lx + 22, box[1] + 88], outline=MAGENTA + (int(255 * ra),), width=4)
-            d.text((lx + 34, box[1] + 62), "actual landing", font=self.f_small, fill=(255, 255, 255, int(230 * ra)))
-
-        # camera inset: what the encoder actually sees
-        if ov.get("inset") is not None:
-            raw = Image.fromarray(ov["inset"])
-            ins = raw.resize((raw.width * 3 // 4, raw.height * 3 // 4), Image.LANCZOS).convert("RGBA")
-            iw, ih = ins.size
-            cap = f"encoder input · {raw.width}x{raw.height} px"
-            bw = max(iw, d.textlength(cap, font=self.f_small))
-            x0, y0 = W - bw - 48, 30
-            d.rounded_rectangle([x0 - 10, y0 - 10, x0 + bw + 10, y0 + ih + 44], radius=10, fill=(12, 14, 18, 190))
-            top.alpha_composite(ins, (int(x0 + (bw - iw) / 2), y0))
-            d.text((x0, y0 + ih + 10), cap, font=self.f_small, fill=(220, 225, 232, 230))
-
-        # stage label (fades and slides in on change)
-        if ov.get("stage"):
+            d.text((box[0] + 34, box[1] + 18), "Result", font=self.f_sub, fill=(205, 212, 222, int(255 * ra)))
+            d.text((box[0] + 34, box[1] + 58), title, font=self.f_title, fill=(255, 255, 255, int(255 * ra)))
+            d.text((box[0] + 36, box[1] + 140), sub, font=self.f_sub, fill=(205, 212, 222, int(255 * ra)))
+            lx = box[0] + 34 + text_w + 40
+            d.ellipse([lx, box[1] + 70, lx + 22, box[1] + 92], outline=(255, 255, 255, int(255 * ra)), width=3)
+            d.text((lx + 34, box[1] + 66), "imagined landing", font=self.f_small, fill=(255, 255, 255, int(230 * ra)))
+            d.ellipse([lx, box[1] + 106, lx + 22, box[1] + 128], outline=MAGENTA + (int(255 * ra),), width=4)
+            d.text((lx + 34, box[1] + 102), "actual landing", font=self.f_small, fill=(255, 255, 255, int(230 * ra)))
+        elif ov.get("stage"):
             a = float(np.clip((self.n - self.stage_start) / 18, 0, 1))
             off = 24 * (1 - a) ** 2
             tw = max(d.textlength(ov["stage"], font=self.f_title), d.textlength(ov.get("sub", ""), font=self.f_sub))
@@ -429,8 +475,9 @@ class DemoRenderer:
             d.text((60 - off, 44), ov["stage"], font=self.f_title, fill=(255, 255, 255, int(255 * a)))
             if ov.get("sub"):
                 d.text((62 - off, 112), ov["sub"], font=self.f_sub, fill=(205, 212, 222, int(255 * a)))
-        if ov.get("hud"):
-            d.text((40, H - 46), ov["hud"], font=self.f_small, fill=(205, 212, 222, 220))
+
+        if ov.get("inset") is not None:
+            self._inset(top, d, ov["inset"])
         wm = "Pool-JEPA  ·  simulation"
         d.text((W - d.textlength(wm, font=self.f_small) - 40, H - 46), wm, font=self.f_small, fill=(255, 255, 255, 110))
         img.alpha_composite(top)

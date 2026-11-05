@@ -1,7 +1,8 @@
 """Record full autonomous shots (Stage 1 aim -> Stage 2 force -> fire) as 1080p MP4 + GIF.
 
-    python planning/record_shot.py --suffix _bigcue --scan 60          # list clean seeds
-    python planning/record_shot.py --suffix _bigcue --seed 0 59        # -> videos/shot_seed0.mp4/.gif, ...
+    python planning/record_shot.py --scan 60                 # list clean seeds
+    python planning/record_shot.py --seed 59                 # one clip per seed
+    python planning/record_shot.py --montage --seed 0 59 33 18   # one video, shots back to back
 
 The scene for a seed is built exactly as in full_shot_test.py: a behind_cue scene and a
 straight-line reachable target (the rest point of a secret force fired from the exact firing
@@ -9,21 +10,28 @@ pose). Stage 1 runs on the decoded cue position with ball avoidance on (it is gi
 balls' true positions to path around), Stage 2 picks the force through the shot model, and the
 robot fires.
 
-Perception is unchanged: the encoder reads the plain 432x240 env.render() frames it was trained
-on (shown as an inset). The clip itself is drawn by planning/demo_render.py from the simulator
-state at 1920x1080, 60 fps:
-  Perceiving       the cue-ball reticle fades in where the encoder locates it
-  Aiming           closed-loop drive to the firing pose (one frame per 60 Hz physics step)
-  Imagining shots  every candidate force's predicted landing point appears, green (on target)
-                   to red (far), then the chosen one is ringed
-  Firing           the shot, with a fading trail; --shot-slowmo interpolates between physics
-                   steps (default 1.5x, labelled on screen)
-  Result card      imagined vs actual landing point and the miss distance
-The table's corner pockets are decorative (the simulated table has none); --no-pockets drops them.
+The clip (planning/demo_render.py, 1920x1080, 60 fps) shows the work as it happens:
+  camera inset     throughout: the encoder's actual input (432x240 camera frame minus the empty
+                   table) with its learned keypoints, the cue-ball keypoints highlighted, and
+                   the decoded cue-ball position. During aiming it updates at the controller's
+                   10 Hz decode rate; during the roll-out it is re-encoded every physics step for
+                   display only (the shot is open loop).
+  Finding the cue ball   the reticle fades in where the encoder locates it
+  Aiming                 closed-loop drive to the firing pose, one frame per physics step
+  Imagining N shots      every candidate strength in the planner's grid (N of them) as a ray
+                         from the cue ball to its predicted landing point, green (close to the
+                         target) to red; the chosen one brightens and locks in. The shot model
+                         predicts landing points, not paths, and every candidate goes along the
+                         same heading, so the rays are straight.
+  Firing                 the shot with a fading trail; --shot-slowmo interpolates between
+                         physics steps (default 1.5x, labelled)
+  Result                 imagined vs actual landing point and the miss distance
+--montage puts several seeds in one video with a title card before each shot and a closing card.
+The corner pockets are decorative (the simulated table has none); --no-pockets drops them.
 
 A seed is "clean" when Stage 1 aligned in time, no ball moved before the shot, the strike
 connected, the cue ball stopped within --clean-miss of the target, and the target is at least
---min-travel away (so the shot is visible).
+--min-travel away.
 Needs: pip install imageio imageio-ffmpeg
 """
 import argparse
@@ -56,11 +64,27 @@ def snap(env):
             "balls": np.array([(b.position.x, b.position.y) for b in env._ball_bodies.values()])}
 
 
+def perceive(s2, raw, with_inset=False):
+    """Encode one camera frame (the (frame, frame) pair the readout was calibrated on) and decode
+    the cue ball. Same computation as Stage2.decode_cue. Optionally also the inset data."""
+    z = cem.encode(s2.encoder, raw, raw, s2.background, s2.device)
+    cue = s2.kp.decode_cue(z)
+    if not with_inset:
+        return cue, None
+    return cue, inset_data(s2, raw, z, cue)
+
+
+def inset_data(s2, raw, z, cue):
+    """The encoder input as an image: (frame - background) / 255 in [-1, 1] -> grey levels."""
+    img = np.clip(128 + 0.5 * (raw.astype(np.float32) - s2.background), 0, 255).astype(np.uint8)
+    return dict(image=img, kps=z.detach().cpu().numpy().reshape(-1, 2), cue_sel=s2.kp.selected, cue=cue)
+
+
 # --------------------------------------------------------------------------------------
 # One episode
 # --------------------------------------------------------------------------------------
 
-def run_episode(env, s2, ctl, scene, t, timeline=None, n_show=48, slowmo=1.5):
+def run_episode(env, s2, ctl, scene, t, timeline=None, slowmo=1.5):
     """Stage 1 -> Stage 2 -> fire on a sampled scene. With a timeline list, appends
     (state, overlay) items for demo_render (one per output frame)."""
     record = timeline is not None
@@ -73,28 +97,25 @@ def run_episode(env, s2, ctl, scene, t, timeline=None, n_show=48, slowmo=1.5):
         if record:
             timeline.append((state, dict(target=target, **ov)))
 
-    # Perceiving: the first decode, shown before the robot moves
+    # Finding the cue ball: the first decode, shown before the robot moves
     if record:
-        raw = env.render()
-        cue_first = s2.decode_cue(raw)
+        cue_first, ins = perceive(s2, env.render(), with_inset=True)
         s0 = snap(env)
-        for i in range(int(1.8 * FPS)):
-            add(s0, stage="Perceiving", sub="the encoder locates the cue ball from raw camera pixels",
+        for i in range(int(2.0 * FPS)):
+            add(s0, stage="Finding the cue ball", sub="located from raw camera pixels by a learned encoder",
                 target_alpha=min(1.0, i / 25), cue_est=cue_first,
-                cue_alpha=float(np.clip((i - 30) / 30, 0, 1)), inset=raw)
+                cue_alpha=float(np.clip((i - 30) / 30, 0, 1)), inset=ins)
 
-    # Stage 1 (Aiming)
+    # Aiming (Stage 1)
     ctl.reset()
-    cue_est, done, n, last_raw = None, False, 0, None
+    cue_est, done, n, ins = None, False, 0, None
     for n in range(STAGE1_MAX_STEPS):
         if n % DECODE_EVERY == 0:
-            last_raw = env.render()
-            cue_est = s2.decode_cue(last_raw)
+            cue_est, ins = perceive(s2, env.render(), with_inset=record)
         left, right, done, info = ctl.step(obs["robot_pose"], cue_est, target,
                                            np.array(obs["ball_positions"][1:]))
-        add(snap(env), stage="Aiming", sub="closed-loop drive to the firing pose (cue position from vision)",
-            cue_est=cue_est, aim_line=True, inset=last_raw,
-            hud=f"heading error {math.degrees(info['head_err']):+6.1f} deg")
+        add(snap(env), stage="Aiming", sub="driving behind the cue ball and lining up with the target",
+            cue_est=cue_est, aim_line=True, inset=ins)
         if done:
             break
         obs = env.step(dict(IDLE, left_pwm=left, right_pwm=right), render=False)
@@ -102,45 +123,56 @@ def run_episode(env, s2, ctl, scene, t, timeline=None, n_show=48, slowmo=1.5):
         if env._balls_settled():
             break
         env.step(IDLE, render=False)
-        add(snap(env), stage="Aiming", sub="closed-loop drive to the firing pose (cue position from vision)",
-            cue_est=cue_est, aim_line=True, inset=last_raw)
+        add(snap(env), stage="Aiming", sub="driving behind the cue ball and lining up with the target",
+            cue_est=cue_est, aim_line=True, inset=ins)
     obs = env._get_observation(render=False)
     balls = np.array(obs["ball_positions"])
     disturbed = bool((np.linalg.norm(balls[1:] - balls0[1:], axis=1) > BALL_MOVED).any())
     cue_moved = bool(np.linalg.norm(balls[0] - balls0[0]) > BALL_MOVED)
 
-    # Stage 2 (Imagining): two rest frames -> z_pre -> every candidate force through the shot model
+    # Imagining (Stage 2): two rest frames -> z_pre -> every candidate force through the shot model
     f_prev = env.render()
     obs = env.step(IDLE, render=True)
     z_pre = cem.encode(s2.encoder, f_prev, obs["frame"], s2.background, s2.device)
     heading = obs["robot_pose"][2] if s2.model.use_heading else None
     force, pinfo = s2.planner.plan(z_pre, target, heading)
+    n_forces = len(s2.planner.forces)
     if record:
         st = snap(env)
         cue_now = s2.kp.decode_cue(z_pre)
-        allf = s2.planner.forces.cpu().numpy()
-        i_best = int(np.argmin(pinfo["all_cost"]))
-        idx = np.unique(np.r_[np.linspace(0, len(allf) - 1, n_show).astype(int), i_best])
-        pts, costs = pinfo["all_rest"][idx], pinfo["all_cost"][idx]
-        reveal = int(2.2 * FPS)
-        for i in range(reveal):
-            k = int(math.ceil((i + 1) / reveal * len(idx)))
-            add(st, stage="Imagining shots", sub="the world model predicts where each force leaves the cue ball",
-                cue_est=cue_now, candidates=(pts[:k], costs[:k]), inset=obs["frame"],
-                hud=f"force {allf[idx[k - 1]]:.2f}  ->  predicted miss {100 * costs[k - 1]:4.1f} cm")
-        for i in range(int(1.3 * FPS)):
-            add(st, stage="Imagining shots", sub=f"best of {len(allf)} imagined forces: {force:.2f}",
-                cue_est=cue_now, candidates=(pts, costs), chosen=pinfo["predicted_rest"],
-                chosen_text=f"force {force:.2f}  ·  predicted miss {100 * pinfo['predicted_miss']:.1f} cm",
-                inset=obs["frame"])
+        ins = inset_data(s2, obs["frame"], z_pre, cue_now)
+        ends, costs = pinfo["all_rest"], pinfo["all_cost"]
+        chosen = int(np.argmin(costs))
+        label = f"Imagining {n_forces} shots"
+        sub = "predicting where each strike strength would leave the cue ball"
+        reveal, spray, lock_n, hold = int(1.4 * FPS), int(0.7 * FPS), int(0.8 * FPS), int(0.9 * FPS)
+        fan = lambda shown, lock, lf=None: dict(start=cue_now, ends=ends, costs=costs, shown=shown,
+                                                 chosen=chosen, lock=lock, lock_frame=lf)
+        for i in range(reveal):     # sweep from soft to hard strikes
+            add(st, stage=label, sub=sub, cue_est=cue_now, inset=ins,
+                fan=fan(int(math.ceil((i + 1) / reveal * n_forces)), 0.0))
+        for i in range(spray):      # the full spray
+            add(st, stage=label, sub=sub, cue_est=cue_now, inset=ins, fan=fan(n_forces, 0.0))
+        for i in range(lock_n):     # the best one brightens
+            k = (i + 1) / lock_n
+            add(st, stage=label, sub=f"best: strength {force:.2f}, predicted to land "
+                                     f"{100 * pinfo['predicted_miss']:.1f} cm from the target",
+                cue_est=cue_now, inset=ins, fan=fan(n_forces, k * k * (3 - 2 * k)))
+        lock_at = len(timeline)
+        for i in range(hold):       # locked in
+            add(st, stage=label, sub=f"best: strength {force:.2f}, predicted to land "
+                                     f"{100 * pinfo['predicted_miss']:.1f} cm from the target",
+                cue_est=cue_now, inset=ins, fan=fan(n_forces, 1.0, lock_at))
 
-    # Fire and roll out
-    states = [snap(env)] if record else None
+    # Firing
+    states, insets = ([snap(env)], [ins]) if record else (None, None)
     obs = env.step(dict(IDLE, fire=True, fire_force=force), render=False)
     connected = env.last_strike_connected
     for k in range(MAX_SETTLE):
         if record:
             states.append(snap(env))
+            # display only: the shot is open loop, nothing is decoded for control here
+            insets.append(perceive(s2, env.render(), with_inset=True)[1])
         if obs["ball_settled"] and k > 0:
             break
         obs = env.step(IDLE, render=False)
@@ -150,15 +182,16 @@ def run_episode(env, s2, ctl, scene, t, timeline=None, n_show=48, slowmo=1.5):
     if record:
         sub = "solenoid strike" + (f"  ·  {slowmo:g}x slow motion" if slowmo > 1 else "")
         frames = interpolate(states, slowmo)
-        for i, s in enumerate(frames):
-            add(s, stage="Firing", sub=sub, trail=True, chosen=pinfo["predicted_rest"],
+        for i, (s, j) in enumerate(frames):
+            add(s, stage="Firing", sub=sub, trail=True, inset=insets[j],
+                fan=dict(start=cue_now, ends=ends, costs=costs, shown=n_forces, chosen=chosen, lock=1.0,
+                         lock_frame=lock_at, only_chosen=True),
                 burst=(i / 14) if i < 14 else None)
-        end = frames[-1]
-        n_forces = len(s2.planner.forces)
+        end = frames[-1][0]
         for i in range(int(3.5 * FPS)):
-            add(end, stage=None, result=dict(predicted=pinfo["predicted_rest"], actual=rest, miss=miss,
-                                              travel=travel, force=force, n_forces=n_forces,
-                                              alpha=min(1.0, i / 20)))
+            add(end, stage="Result", inset=insets[-1],
+                result=dict(predicted=pinfo["predicted_rest"], actual=rest, miss=miss, travel=travel,
+                            force=force, n_forces=n_forces, alpha=min(1.0, i / 20)))
 
     stats = dict(aligned=done, steps=n, disturbed=disturbed, cue_moved=cue_moved, connected=connected,
                  miss=miss, force=force, predicted_miss=pinfo["predicted_miss"], travel=travel)
@@ -184,26 +217,49 @@ def describe(seed, st, clean):
             f"(predicted {100 * st['predicted_miss']:4.1f}) {'CLEAN' if clean else ''}")
 
 
-def render_video(timeline, out_base, args):
-    """Stream 1080p frames to the MP4 (never all in memory); keep a downscaled copy for the GIF."""
-    import imageio.v2 as imageio
-    renderer = DemoRenderer(pockets=not args.no_pockets)
-    mp4, gif = out_base + ".mp4", out_base + ".gif"
-    gif_every = max(1, round(FPS / args.gif_fps))
-    gif_h = round(args.gif_width * 9 / 16)
-    gif_frames, t0 = [], time.time()
-    with imageio.get_writer(mp4, fps=FPS, codec="libx264", quality=None, pixelformat="yuv420p",
-                            macro_block_size=8, ffmpeg_params=["-crf", "18", "-preset", "slow",
-                                                               "-movflags", "+faststart"]) as w:
-        for i, (state, ov) in enumerate(timeline):
-            f = renderer.frame(state, ov)
-            w.append_data(f)
-            if i % gif_every == 0:
-                gif_frames.append(np.asarray(Image.fromarray(f).resize((args.gif_width, gif_h), Image.LANCZOS)))
-    imageio.mimsave(gif, gif_frames, duration=1000 * gif_every / FPS, loop=0)
-    print(f"  {len(timeline)} frames ({len(timeline) / FPS:.1f} s) rendered in {time.time() - t0:.0f} s")
-    for p in (mp4, gif):
-        print(f"  saved {p} ({os.path.getsize(p) / 2**20:.1f} MB)")
+# --------------------------------------------------------------------------------------
+# Video output
+# --------------------------------------------------------------------------------------
+
+class VideoOut:
+    """Streams 1080p frames to an H.264 MP4 (never all in memory); keeps a small copy for the GIF."""
+
+    def __init__(self, base, args):
+        import imageio.v2 as imageio
+        self.imageio, self.base, self.args = imageio, base, args
+        self.w = imageio.get_writer(base + ".mp4", fps=FPS, codec="libx264", quality=None,
+                                    pixelformat="yuv420p", macro_block_size=8,
+                                    ffmpeg_params=["-crf", "18", "-preset", "slow", "-movflags", "+faststart"])
+        self.gif_every = max(1, round(FPS / args.gif_fps))
+        self.gif, self.n, self.t0 = [], 0, time.time()
+
+    def add(self, f):
+        self.w.append_data(f)
+        if self.n % self.gif_every == 0:
+            size = (self.args.gif_width, round(self.args.gif_width * 9 / 16))
+            self.gif.append(np.asarray(Image.fromarray(f).resize(size, Image.LANCZOS)))
+        self.n += 1
+
+    def close(self):
+        self.w.close()
+        self.imageio.mimsave(self.base + ".gif", self.gif, duration=1000 * self.gif_every / FPS, loop=0)
+        print(f"  {self.n} frames ({self.n / FPS:.1f} s) rendered in {time.time() - self.t0:.0f} s")
+        for ext in (".mp4", ".gif"):
+            print(f"  saved {self.base + ext} ({os.path.getsize(self.base + ext) / 2**20:.1f} MB)")
+
+
+def add_card(out, renderer, title, sub="", note="", seconds=1.6):
+    n = int(seconds * FPS)
+    fade = int(0.3 * FPS)
+    for i in range(n):
+        a = min(1.0, (i + 1) / fade, (n - i) / fade)
+        out.add(renderer.card(title, sub, a, note))
+
+
+def add_shot(out, renderer, timeline):
+    renderer.reset()
+    for state, ov in timeline:
+        out.add(renderer.frame(state, ov))
 
 
 def main(args):
@@ -232,17 +288,48 @@ def main(args):
         return
 
     os.makedirs(args.out_dir, exist_ok=True)
-    for seed in args.seed:
+    renderer = DemoRenderer(pockets=not args.no_pockets)
+
+    def episode(seed):
         scene, t = scene_for_seed(env, s2, seed)
         if t is None:
             print(f"seed {seed}: no straight reachable target; skipped")
-            continue
+            return None, None
         timeline = []
         st = run_episode(env, s2, ctl, scene, t, timeline=timeline, slowmo=args.shot_slowmo)
         print(describe(seed, st, is_clean(st, args)))
         if not is_clean(st, args):
             print("  note: this seed is not clean (see criteria in the docstring); rendering anyway")
-        render_video(timeline, os.path.join(args.out_dir, f"shot_seed{seed}{args.suffix}"), args)
+        return st, timeline
+
+    if args.montage:
+        seeds = "_".join(map(str, args.seed))
+        out = VideoOut(os.path.join(args.out_dir, f"montage{args.suffix}_{seeds}"), args)
+        add_card(out, renderer, "A robot that imagines its shots",
+                 "it finds the cue ball from camera pixels and predicts each strike before taking it",
+                 seconds=2.4)
+        misses = []
+        for i, seed in enumerate(args.seed):
+            st, timeline = episode(seed)
+            if st is None:
+                continue
+            misses.append(st["miss"])
+            add_card(out, renderer, f"Shot {i + 1} of {len(args.seed)}",
+                     f"target {100 * st['travel']:.0f} cm away")
+            add_shot(out, renderer, timeline)
+        add_card(out, renderer, f"{len(misses)} shots, average miss {100 * np.mean(misses):.1f} cm",
+                 "learned perception + a learned model of where each strike leaves the cue ball",
+                 note=args.montage_note, seconds=3.0)
+        out.close()
+        return
+
+    for seed in args.seed:
+        st, timeline = episode(seed)
+        if st is None:
+            continue
+        out = VideoOut(os.path.join(args.out_dir, f"shot_seed{seed}{args.suffix}"), args)
+        add_shot(out, renderer, timeline)
+        out.close()
 
 
 if __name__ == "__main__":
@@ -250,6 +337,9 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, nargs="+", default=[0],
                    help="scene seed(s) to record (with --scan: the first seed scanned)")
     p.add_argument("--scan", type=int, default=0, help="try this many seeds without recording; list clean ones")
+    p.add_argument("--montage", action="store_true", help="record all --seed shots into one video")
+    p.add_argument("--montage-note", default="simulation · selected successful shots from a 60-scene scan",
+                   help="small print on the closing card")
     p.add_argument("--out-dir", default=os.path.join(cem.REPO, "videos"))
     p.add_argument("--shot-slowmo", type=float, default=1.5,
                    help="frames per physics step during the shot (interpolated; 1 = real time)")
