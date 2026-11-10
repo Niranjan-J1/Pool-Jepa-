@@ -321,6 +321,36 @@ def test_respawn_legal():
           f"respawn=({cx:.4f},{cy:.4f})")
 
 
+def test_ball_slots():
+    env = SimEnv(n_object_balls=3)
+    env.reset(layout={0: (0.0, 0.0), 1: (0.1, 0.05), 2: (-0.1, -0.05), 3: (0.15, -0.08)})
+    pos0, mask0 = env.ball_slots()
+    shape_ok = pos0.shape == (8, 2) and mask0.shape == (8,) and mask0.dtype == bool
+    init_ok = list(mask0) == [True] * 4 + [False] * 4 and not pos0[4:].any()
+    # Pot ball 2 (nothing else moves).
+    px, py = pocket_centers()[0]
+    start = (px * 0.6, py * 0.6)
+    env._ball_bodies[2].position = start
+    d = (px - start[0], py - start[1]); n = math.hypot(*d)
+    env._ball_bodies[2].velocity = (0.8 * d[0] / n, 0.8 * d[1] / n)
+    for _ in range(400):
+        if 2 in env.step(IDLE, render=False)["potted"]:
+            break
+    pos1, mask1 = env.ball_slots()
+    flipped = list(mask1) == [True, True, False, True, False, False, False, False]
+    pot_zero = not pos1[2].any()
+    others = all(np.array_equal(pos1[i], pos0[i]) for i in (0, 1, 3))
+    obs_keys_ok = isinstance(env._get_observation(render=False)["ball_positions"], list)
+    try:
+        SimEnv().ball_slots(); legacy_raises = False
+    except RuntimeError:
+        legacy_raises = True
+    check("ball_slots: shape, mask flips on pot, others unchanged",
+          shape_ok and init_ok and flipped and pot_zero and others and obs_keys_ok and legacy_raises,
+          f"shape={shape_ok} init={init_ok} flipped={flipped} potted_pos_zero={pot_zero} "
+          f"others_unchanged={others} list_obs_intact={obs_keys_ok} legacy_raises={legacy_raises}")
+
+
 if __name__ == "__main__":
     test_regression()
     test_head_on()
@@ -329,6 +359,7 @@ if __name__ == "__main__":
     test_pocket_once_only()
     test_scratch()
     test_respawn_legal()
+    test_ball_slots()
     test_no_tunneling()
     test_layout_generator()
     test_settle_terminates()

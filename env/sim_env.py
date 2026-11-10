@@ -593,6 +593,21 @@ class SimEnv(BaseEnv):
 
     # ---- observation ----------------------------------------------------------
 
+    def ball_slots(self) -> tuple[np.ndarray, np.ndarray]:
+        """Fixed-slot view of the balls (multiball mode only).
+
+        Returns (positions, mask): positions is float64 (8, 2) in metres indexed by ball id
+        (0 = cue, 1..7); mask is bool (8,), True if that ball is on the table. Absent or potted
+        balls have position (0, 0) and mask False."""
+        if self._legacy:
+            raise RuntimeError("ball_slots() is only available in multiball mode (n_object_balls=...)")
+        positions = np.zeros((MAX_OBJECT_BALLS + 1, 2))
+        mask = np.zeros(MAX_OBJECT_BALLS + 1, dtype=bool)
+        for ball_id, body in self._ball_bodies.items():
+            positions[ball_id] = (body.position.x, body.position.y)
+            mask[ball_id] = True
+        return positions, mask
+
     def _get_observation(self, render: bool = True) -> Observation:
         rb = self._robot_body
         ball_positions = [
