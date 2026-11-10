@@ -42,7 +42,10 @@ ROLLING_DECEL = 0.5  # m/s^2
 # Multi-ball defaults (used only when n_object_balls is given, i.e. not legacy mode)
 OBJECT_BALL_ELASTICITY = 0.95     # ball-ball rebound: near-elastic, clean momentum transfer
 MULTIBALL_CUSHION_ELASTICITY = 0.75  # cushion rebound: lively but lossy
-POCKET_RADIUS = 1.6 * BALL_RADIUS  # 0.016 m; a ball's centre inside this of a pocket is potted
+# Multiball rails use a thinner collision radius than the legacy 2 cm so a ball can roll close
+# enough to a corner for a modest pocket to catch it (the rail's thickness forms the pocket jaws).
+MULTIBALL_CUSHION_RADIUS = 0.006
+POCKET_RADIUS = 2.8 * BALL_RADIUS  # 0.028 m capture radius; a ball centre inside this is potted
 CUE_DEFAULT_SPOT = (0.0, 0.0)      # where the cue ball respawns after a scratch
 MAX_OBJECT_BALLS = 7
 
@@ -194,7 +197,14 @@ class SimEnv(BaseEnv):
         self._cushion_elasticity = (
             cushion_elasticity if cushion_elasticity is not None
             else (CUSHION_ELASTICITY if self._legacy else MULTIBALL_CUSHION_ELASTICITY))
+        self._cushion_radius = CUSHION_THICKNESS if self._legacy else MULTIBALL_CUSHION_RADIUS
         self._pocket_radius = pocket_radius
+        self._pockets = pocket_centers()
+        self._pocket_r2 = pocket_radius * pocket_radius
+        # A ball with |x| < near_x and |y| < near_y is too far from every pocket to be potted;
+        # this interior early-out keeps the per-substep check cheap.
+        self._near_x = TABLE_LENGTH / 2 - pocket_radius
+        self._near_y = TABLE_WIDTH / 2 - pocket_radius
         self._cue_spawn = (float(cue_spawn[0]), float(cue_spawn[1]))
 
         self._space: pymunk.Space | None = None
@@ -221,8 +231,12 @@ class SimEnv(BaseEnv):
     def _add_walls(self, space: pymunk.Space):
         hw = TABLE_WIDTH / 2
         hl = TABLE_LENGTH / 2
-        t = CUSHION_THICKNESS
-
+        # Solid rectangle in both modes, so a ball can never leave the table (no tunnelling or
+        # escaping through a pocket -- potting is handled by the sensor check, not a gap). Legacy
+        # keeps the original 2 cm collision radius for byte-identical behaviour; multiball uses a
+        # thinner rail so a ball can roll close enough to the corners for a modest pocket radius
+        # to catch it.
+        t = self._cushion_radius
         wall_segments = [
             ((-hl, -hw), (hl, -hw)),   # bottom
             ((-hl, hw), (hl, hw)),     # top
@@ -489,12 +503,25 @@ class SimEnv(BaseEnv):
 
     def _check_pockets(self):
         """Pot any ball whose centre is within pocket_radius of a pocket. Object balls are
-        removed and recorded (in order); the cue ball is a scratch and is respawned."""
-        pockets = pocket_centers()
-        for ball_id in list(self._ball_bodies):
-            body = self._ball_bodies[ball_id]
-            x, y = body.position.x, body.position.y
-            if any(math.hypot(x - px, y - py) <= self._pocket_radius for px, py in pockets):
+        removed and recorded (in order); the cue ball is a scratch and is respawned. Called
+        every substep so a fast ball is caught at its closest approach to a pocket."""
+        r2 = self._pocket_r2
+        nx, ny, pockets = self._near_x, self._near_y, self._pockets
+        potted_now = None
+        for ball_id, body in self._ball_bodies.items():
+            pos = body.position
+            x, y = pos.x, pos.y
+            if -nx < x < nx and -ny < y < ny:
+                continue  # interior: too far from every pocket
+            for px, py in pockets:
+                dx, dy = x - px, y - py
+                if dx * dx + dy * dy <= r2:
+                    if potted_now is None:
+                        potted_now = []
+                    potted_now.append(ball_id)
+                    break
+        if potted_now:
+            for ball_id in potted_now:
                 if ball_id == CUE_ID:
                     self._scratch = True
                     self._respawn_cue()
