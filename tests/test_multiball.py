@@ -351,6 +351,46 @@ def test_ball_slots():
           f"others_unchanged={others} list_obs_intact={obs_keys_ok} legacy_raises={legacy_raises}")
 
 
+def test_reset_aim():
+    import json
+    from env.sim_env import ROBOT_LENGTH
+    # (a) robot sits behind the cue along the requested line.
+    worst_ang, worst_dist, n = 0.0, 0.0, 0
+    for aim in (0.3, 2.0, -1.5, 3.0, -3.0, 0.0):
+        for seed in range(5):
+            env = SimEnv(n_object_balls=3)
+            obs = env.reset(setup="behind_cue", seed=seed, aim=aim)
+            x, y, h = obs["robot_pose"]
+            front = (x + ROBOT_LENGTH / 2 * math.cos(h), y + ROBOT_LENGTH / 2 * math.sin(h))
+            cue = obs["ball_positions"][0]
+            v = (cue[0] - front[0], cue[1] - front[1])
+            ang_err = abs((math.atan2(v[1], v[0]) - aim + math.pi) % (2 * math.pi) - math.pi)
+            dist_err = abs(math.hypot(*v) - env.last_setup["distance"])
+            worst_ang, worst_dist, n = max(worst_ang, ang_err), max(worst_dist, dist_err), n + 1
+    check("aim=a: robot front -> cue lies along angle a", worst_ang < 1e-9 and worst_dist < 1e-9,
+          f"{n} resets, worst angle error {worst_ang:.2e} rad, worst distance error {worst_dist:.2e} m")
+    # (b) aim=None reproduces the pre-change layouts exactly (saved from the previous commit).
+    with open(os.path.join(os.path.dirname(__file__), "baseline_multiball_layout.json")) as f:
+        base = json.load(f)
+    mism = 0
+    for key, ref in base.items():
+        n_obj, seed = map(int, key.split("_"))
+        env = SimEnv(n_object_balls=n_obj)
+        obs = env.reset(setup="behind_cue", seed=seed)
+        cur = {"robot": list(obs["robot_pose"]), "balls": [list(p) for p in obs["ball_positions"]],
+               "setup": env.last_setup}
+        mism += cur != ref
+    check("aim=None reproduces pre-change layouts exactly", mism == 0, f"{len(base)} layouts, {mism} mismatches")
+    # (c) the aim only changes the aim: with the same seed the cue/distance/offset draws match.
+    a = SimEnv(n_object_balls=2); b = SimEnv(n_object_balls=2)
+    a.reset(setup="behind_cue", seed=7)
+    b.reset(setup="behind_cue", seed=7, aim=1.0)
+    check("aim override keeps distance/offset draws aligned", a.last_setup == b.last_setup or
+          (a.last_setup["distance"] == b.last_setup["distance"]
+           and a.last_setup["aim_offset"] == b.last_setup["aim_offset"]),
+          f"{a.last_setup} vs {b.last_setup}")
+
+
 if __name__ == "__main__":
     test_regression()
     test_head_on()
@@ -360,6 +400,7 @@ if __name__ == "__main__":
     test_scratch()
     test_respawn_legal()
     test_ball_slots()
+    test_reset_aim()
     test_no_tunneling()
     test_layout_generator()
     test_settle_terminates()

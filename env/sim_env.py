@@ -284,7 +284,8 @@ class SimEnv(BaseEnv):
 
     # ---- reset ----------------------------------------------------------------
 
-    def reset(self, setup: str = "default", layout=None, seed: int | None = None) -> Observation:
+    def reset(self, setup: str = "default", layout=None, seed: int | None = None,
+              aim: float | None = None) -> Observation:
         """Reset the table.
 
         setup="default":    robot at a fixed spot, cue ball at a fixed spot, object balls random.
@@ -296,7 +297,13 @@ class SimEnv(BaseEnv):
             When given it is used verbatim instead of sampling; must list the cue and exactly
             n_object_balls object balls. When None a seeded legal layout is generated.
         seed: seed the layout RNG in multiball mode (reproducible without touching global random).
+        aim: (multiball, setup="behind_cue" only) aim angle in radians, robot -> cue direction.
+            None keeps the random aim. The random aim is still drawn and discarded when aim is
+            given, so every other draw (cue position, distance, offset, layout) is identical to
+            the aim=None case for the same seed.
         """
+        if aim is not None and (self._legacy or setup != "behind_cue"):
+            raise ValueError("aim is only supported for multiball mode with setup='behind_cue'")
         self._space = self._create_space()
         self._ball_bodies.clear()
         self._ball_shapes.clear()
@@ -309,7 +316,7 @@ class SimEnv(BaseEnv):
         if self._legacy:
             self._reset_legacy(setup)
         else:
-            self._reset_multiball(setup, layout, seed)
+            self._reset_multiball(setup, layout, seed, aim)
 
         self.last_strike_connected = False
         return self._get_observation()
@@ -331,7 +338,7 @@ class SimEnv(BaseEnv):
         for ball_id, name in enumerate(LEGACY_BALL_NAMES):
             self._add_ball(self._space, ball_id, ball_pos[name], BALL_COLORS[name])
 
-    def _reset_multiball(self, setup: str, layout, seed):
+    def _reset_multiball(self, setup: str, layout, seed, aim=None):
         rng = random.Random(seed) if seed is not None else random
         n = self._n_object_balls
 
@@ -339,7 +346,7 @@ class SimEnv(BaseEnv):
             robot_pos, robot_angle = (-TABLE_LENGTH / 4, 0.0), 0.0
             cue_pos = self._cue_spawn
         elif setup == "behind_cue":
-            robot_pos, robot_angle, cue_pos = self._sample_behind_cue_robot_cue(rng)
+            robot_pos, robot_angle, cue_pos = self._sample_behind_cue_robot_cue(rng, aim)
         else:
             raise ValueError(f"Unknown setup: {setup}")
         self.last_setup = {} if setup == "default" else self.last_setup
@@ -423,9 +430,10 @@ class SimEnv(BaseEnv):
             return pos, heading, balls
         raise RuntimeError("Could not sample a valid behind_cue setup")
 
-    def _sample_behind_cue_robot_cue(self, rng):
+    def _sample_behind_cue_robot_cue(self, rng, aim_override=None):
         """Multiball behind_cue: sample only the robot pose and cue position (object balls are
-        placed afterwards by random_layout). Same geometry as the legacy sampler."""
+        placed afterwards by random_layout). Same geometry as the legacy sampler. If aim_override
+        is given it replaces the sampled aim (the draw is still consumed)."""
         ball_margin = BALL_RADIUS + 0.005
         hl = TABLE_LENGTH / 2 - (CUSHION_THICKNESS + ball_margin)
         hw = TABLE_WIDTH / 2 - (CUSHION_THICKNESS + ball_margin)
@@ -434,6 +442,8 @@ class SimEnv(BaseEnv):
             if not _clear_of_pockets(cue[0], cue[1], self._pocket_radius):
                 continue
             aim = rng.uniform(-math.pi, math.pi)
+            if aim_override is not None:
+                aim = float(aim_override)
             dist = rng.uniform(*SETUP_DISTANCE_RANGE)
             offset = rng.uniform(*SETUP_AIM_OFFSET_RANGE)
             heading = aim + offset
