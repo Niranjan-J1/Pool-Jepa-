@@ -535,9 +535,40 @@ class SimEnv(BaseEnv):
         del self._ball_shapes[ball_id]
         del self._ball_colors[ball_id]
 
+    def _spawn_point_legal(self, pt) -> bool:
+        """True if a cue ball centred at pt overlaps no other ball, the robot, a pocket or a cushion."""
+        x, y = pt
+        if not _center_in_play(x, y, BALL_RADIUS + 0.003):
+            return False
+        if not _clear_of_pockets(x, y, self._pocket_radius):
+            return False
+        rb = self._robot_body
+        if self._overlaps_robot(pt, (rb.position.x, rb.position.y), rb.angle, BALL_RADIUS + 0.002):
+            return False
+        min_sep = 2 * BALL_RADIUS + 0.002
+        for ball_id, body in self._ball_bodies.items():
+            if ball_id != CUE_ID and math.hypot(x - body.position.x, y - body.position.y) < min_sep:
+                return False
+        return True
+
+    def _find_cue_spawn(self) -> tuple[float, float]:
+        """cue_spawn if legal, else the closest legal point found by searching outward in 1 mm
+        rings (72 directions per ring). Deterministic."""
+        sx, sy = self._cue_spawn
+        if self._spawn_point_legal((sx, sy)):
+            return (sx, sy)
+        for k in range(1, int(max(TABLE_LENGTH, TABLE_WIDTH) / 0.001)):
+            r = k * 0.001
+            for j in range(72):
+                a = 2 * math.pi * j / 72
+                pt = (sx + r * math.cos(a), sy + r * math.sin(a))
+                if self._spawn_point_legal(pt):
+                    return pt
+        raise RuntimeError("no legal cue respawn point on the table")
+
     def _respawn_cue(self):
         body = self._ball_bodies[CUE_ID]
-        body.position = self._cue_spawn
+        body.position = self._find_cue_spawn()
         body.velocity = (0.0, 0.0)
         body.angular_velocity = 0.0
 

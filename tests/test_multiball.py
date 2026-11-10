@@ -266,6 +266,61 @@ def test_speed():
     return dict(legacy=s_legacy, n0=s0, n3=s3, n5=s5)
 
 
+def _scratch_cue(env):
+    """Roll the cue into corner pocket 3 until a scratch registers."""
+    px, py = pocket_centers()[3]
+    start = (px * 0.5, py * 0.5)
+    env._ball_bodies[0].position = start
+    d = (px - start[0], py - start[1]); n = math.hypot(*d)
+    env._ball_bodies[0].velocity = (0.8 * d[0] / n, 0.8 * d[1] / n)
+    for _ in range(400):
+        if env.step(IDLE, render=False)["scratch"]:
+            return True
+    return False
+
+
+def _legal_cue(env):
+    """Return (ok, detail): cue overlaps no ball/robot/pocket/cushion."""
+    from env.sim_env import _center_in_play, _clear_of_pockets
+    cx, cy = env._ball_bodies[0].position
+    for i, b in env._ball_bodies.items():
+        if i and math.hypot(cx - b.position.x, cy - b.position.y) < 2 * BALL_RADIUS:
+            return False, f"overlaps ball {i}"
+    rb = env._robot_body
+    if env._overlaps_robot((cx, cy), (rb.position.x, rb.position.y), rb.angle, BALL_RADIUS):
+        return False, "overlaps robot"
+    if not _clear_of_pockets(cx, cy, env._pocket_radius):
+        return False, "in pocket mouth"
+    if not _center_in_play(cx, cy, BALL_RADIUS):
+        return False, "on cushion"
+    return True, ""
+
+
+def test_respawn_legal():
+    # Object ball sitting exactly on the spawn point.
+    env = SimEnv(n_object_balls=2, cue_spawn=(0.0, 0.0))
+    env.reset(layout={0: (0.0, 0.1), 1: (0.0, 0.0), 2: (0.012, 0.0)})
+    scratched = _scratch_cue(env)
+    ok, why = _legal_cue(env)
+    cx, cy = env._ball_bodies[0].position
+    moved = math.hypot(cx, cy)
+    check("scratch respawn avoids a ball on the spawn point", scratched and ok and 0.0 < moved < 0.08,
+          f"scratch={scratched}, legal={ok} {why}, respawn=({cx:.4f},{cy:.4f}), moved {moved*1000:.1f} mm")
+    # Spawn point under the robot.
+    env = SimEnv(n_object_balls=1, cue_spawn=(-TABLE_LENGTH / 4, 0.0))
+    env.reset(layout={0: (0.0, 0.1), 1: (0.1, -0.1)})
+    scratched = _scratch_cue(env)
+    ok, why = _legal_cue(env)
+    check("scratch respawn avoids the robot", scratched and ok, f"scratch={scratched}, legal={ok} {why}")
+    # Free spawn point is used verbatim.
+    env = SimEnv(n_object_balls=1, cue_spawn=(0.05, 0.05))
+    env.reset(layout={0: (0.0, 0.1), 1: (0.1, -0.1)})
+    _scratch_cue(env)
+    cx, cy = env._ball_bodies[0].position
+    check("scratch respawn uses cue_spawn when legal", abs(cx - 0.05) < 1e-9 and abs(cy - 0.05) < 1e-9,
+          f"respawn=({cx:.4f},{cy:.4f})")
+
+
 if __name__ == "__main__":
     test_regression()
     test_head_on()
@@ -273,6 +328,7 @@ if __name__ == "__main__":
     test_pockets_all_six()
     test_pocket_once_only()
     test_scratch()
+    test_respawn_legal()
     test_no_tunneling()
     test_layout_generator()
     test_settle_terminates()
