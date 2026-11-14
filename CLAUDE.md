@@ -21,6 +21,7 @@ Pool-JEPA: a small robot plays pool on a 26" tabletop table using a self-supervi
 - Big data and checkpoints live on /mnt/wato-drive2 via the POOLJEPA_DATA env var, never in git or /home (quota).
 - Checkpoints (encoder_best.pt, shot_model_bigcue.pt) and frames_background.npy exist only on the cluster. The background must be regenerated for multiball renders.
 - Workflow: edit on laptop, push to GitHub, pull on the cluster. Always commit and push before I run anything on the cluster.
+- Code must run on Python 3.10 (cluster). Do not use 3.11+ features.
 
 # Conventions
 - Units: sim in metres internally; multiball obs also gives ball_positions_cm.

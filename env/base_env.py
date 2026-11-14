@@ -1,5 +1,10 @@
 from abc import ABC, abstractmethod
-from typing import NotRequired, TypedDict
+from typing import TypedDict
+
+try:
+    from typing import NotRequired  # Python 3.11+
+except ImportError:  # Python 3.10 (cluster)
+    from typing_extensions import NotRequired
 
 import numpy as np
 
