@@ -14,7 +14,8 @@ Splits (scene seeds never overlap between splits or shards):
 --n-balls LO HI overrides the ball-count range.
 
 mb_shots aim mixture (per shot, from the scene seed):
-    ghost   50%  heading through the ghost-ball point of a random (object ball, pocket), +-3 deg
+    ghost   50%  heading through the ghost-ball point of a random (object ball, pocket) with a
+                 cut <= 60 deg and clear paths, +-1 deg, force 0.4-1.0
     ball    30%  heading at a random object ball, anywhere within its angular width (a hit)
     uniform 20%  any heading
 The robot's heading is the shot direction (the solenoid fires along it), so the reset aim is
@@ -35,9 +36,10 @@ SPLIT_SEED_STRIDE = 100_000_000
 SHARD_SEED_STRIDE = 1_000_000
 AIM_MIX = (("ghost", 0.5), ("ball", 0.3), ("uniform", 0.2))
 AIM_KIND_ID = {"ghost": 0, "ball": 1, "uniform": 2}
-GHOST_JITTER = math.radians(3.0)
+GHOST_JITTER = math.radians(1.0)   # 3 deg was ~1.6 cm at the ghost point over 30 cm: too much
 GHOST_MAX_CUT = math.radians(60.0)   # skip pockets the ball cannot realistically be cut into
 MB_FORCE_RANGE = (0.05, 1.0)
+GHOST_FORCE_RANGE = (0.4, 1.0)
 MB_MAX_SETTLE_STEPS = 900
 MB_SHOTS_PER_FILE = 1000
 MB_FRAME_EPISODES_PER_FILE = 100
@@ -58,6 +60,19 @@ def _wrap(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
+def _path_blocked(a, b, obstacles):
+    """True if a ball rolling from a to b would touch any obstacle ball (centre within 2R of
+    the segment)."""
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    L2 = dx * dx + dy * dy or 1e-12
+    for ox, oy in obstacles:
+        t = max(0.0, min(1.0, ((ox - ax) * dx + (oy - ay) * dy) / L2))
+        if math.hypot(ax + t * dx - ox, ay + t * dy - oy) < 2 * BALL_RADIUS:
+            return True
+    return False
+
+
 def choose_heading(rng, cue, balls):
     """Pick the shot direction for one scene. Returns (heading, kind, target_ball, target_pocket)."""
     u, acc = rng.random(), 0.0
@@ -76,14 +91,19 @@ def choose_heading(rng, cue, balls):
         d = math.hypot(bx - cue[0], by - cue[1])
         half = math.asin(min(1.0, 2 * BALL_RADIUS / d))
         return _wrap(math.atan2(by - cue[1], bx - cue[0]) + rng.uniform(-half, half)), "ball", b, -1
-    # Ghost ball: only pockets with a makeable cut (<= GHOST_MAX_CUT); none -> aim at the ball.
+    # Ghost ball: only pockets with a makeable cut (<= GHOST_MAX_CUT) and clear paths (cue ->
+    # ghost point, target ball -> pocket, no other ball in the way); none -> aim at the ball.
+    others = [p for i, p in balls.items() if i != b]
     options = []
     for k, (px, py) in enumerate(pocket_centers()):
         n = math.hypot(px - bx, py - by) or 1.0
         gx, gy = bx - 2 * BALL_RADIUS * (px - bx) / n, by - 2 * BALL_RADIUS * (py - by) / n
         shot = math.atan2(gy - cue[1], gx - cue[0])
-        if abs(_wrap(shot - math.atan2(py - by, px - bx))) <= GHOST_MAX_CUT:
-            options.append((k, shot))
+        if abs(_wrap(shot - math.atan2(py - by, px - bx))) > GHOST_MAX_CUT:
+            continue
+        if _path_blocked(cue, (gx, gy), others) or _path_blocked((bx, by), (px, py), others):
+            continue
+        options.append((k, shot))
     if not options:
         d = math.hypot(bx - cue[0], by - cue[1])
         half = math.asin(min(1.0, 2 * BALL_RADIUS / d))
@@ -166,7 +186,10 @@ def collect_mb_shots(out_dir, prefix, shots, split="train", shard=0, n_range=Non
         f_prev = obs["frame"]
         pre = env.step(IDLE)                      # encoder input before the shot: (f_prev, f_pre)
         slots_pre, mask_pre = env.ball_slots()
-        force = random.Random(seed ^ 0x5EED).uniform(*force_range)
+        # Ghost-ball shots are meant to pot, and soft ones never reach the pocket (0% in the
+        # smoke run), so they get the harder GHOST_FORCE_RANGE; other aims keep the full range.
+        f_range = GHOST_FORCE_RANGE if info["kind"] == "ghost" else force_range
+        force = random.Random(seed ^ 0x5EED).uniform(*f_range)
         env.step(Action(left_pwm=0.0, right_pwm=0.0, fire=True, fire_force=force), render=False)
         connected = env.last_strike_connected
         post, steps = env.settle(max_steps=MB_MAX_SETTLE_STEPS)
