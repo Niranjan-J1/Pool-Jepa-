@@ -77,22 +77,53 @@ def test_cushion_angle():
     env.reset(layout={0: (0.0, 0.0)})
     env._ball_bodies[0].position = start
     env._ball_bodies[0].velocity = (vx, vy)
-    before_angle = None
+    # Watch vy flip sign (the bounce). The incoming angle/speed are measured from the last
+    # velocity before the flip (after rolling resistance/damping), not assumed.
+    before = None
     after = None
-    # Watch vy flip sign (the bounce) and record incoming/outgoing angles.
-    prev_vy = vy
+    prev_v = env._ball_bodies[0].velocity
     for _ in range(400):
         env.step(IDLE, render=False)
         v = env._ball_bodies[0].velocity
-        if before_angle is None:
-            before_angle = math.degrees(math.atan2(prev_vy, v.x)) if False else 45.0
-        if v.y < 0 and prev_vy >= 0 and v.length > 1e-3:
+        if v.y < 0 and prev_v.y >= 0 and v.length > 1e-3:
+            before = (abs(math.degrees(math.atan2(prev_v.y, prev_v.x))), prev_v.length)
             after = (abs(math.degrees(math.atan2(v.y, v.x))), v.length)
             break
-        prev_vy = v.y
-    ok = after is not None and abs(after[0] - 45.0) < 12.0 and after[1] < speed_in
-    check("cushion rebound ~45 deg with reduced speed", ok,
-          (f"out angle {after[0]:.1f} deg, speed {after[1]:.3f} < {speed_in}" if after else "no bounce seen"))
+        prev_v = v
+    ok = after is not None and abs(after[0] - before[0]) < 12.0 and after[1] < before[1]
+    check("cushion rebound angle ~ incoming angle, with reduced speed", ok,
+          (f"in {before[0]:.1f} deg @ {before[1]:.3f} m/s -> out {after[0]:.1f} deg @ {after[1]:.3f} m/s"
+           if after else "no bounce seen"))
+
+
+# --- render: drawn felt edge matches the physical rail ----------------------------------
+def test_render_felt_edge():
+    from env.sim_env import (RENDER_WIDTH, RENDER_HEIGHT, RENDER_MARGIN, FELT_COLOR,
+                             MULTIBALL_CUSHION_RADIUS)
+    env = SimEnv(n_object_balls=0)
+    env.reset(layout={0: (0.0, 0.0)})
+    env._ball_bodies[0].position = (0.0, 0.0)
+    env._robot_body.position = (0.0, -TABLE_WIDTH / 4)   # keep the robot off the scan lines
+    env._robot_body.angle = 0.0
+    img = env.render().astype(int)
+    half_w = TABLE_LENGTH / 2 + RENDER_MARGIN
+    half_h = half_w * RENDER_HEIGHT / RENDER_WIDTH
+    px_per_m = RENDER_WIDTH / (2 * half_w)
+    felt = np.array([int(FELT_COLOR[i:i + 2], 16) for i in (1, 3, 5)])
+    is_felt = np.abs(img - felt).sum(axis=2) <= 6
+    lim_x = TABLE_LENGTH / 2 - MULTIBALL_CUSHION_RADIUS   # where a ball surface meets the rail
+    lim_y = TABLE_WIDTH / 2 - MULTIBALL_CUSHION_RADIUS
+    # Expected boundaries in pixel-edge coordinates; measured = extent of the felt run.
+    row = int(round((half_h - TABLE_WIDTH / 4) * px_per_m))        # y = +hw/2
+    col = int(round((TABLE_LENGTH / 4 + half_w) * px_per_m))       # x = +hl/2
+    xs = np.flatnonzero(is_felt[row]); ys = np.flatnonzero(is_felt[:, col])
+    errs = [
+        abs(xs[0] - (half_w - lim_x) * px_per_m), abs(xs[-1] + 1 - (half_w + lim_x) * px_per_m),
+        abs(ys[0] - (half_h - lim_y) * px_per_m), abs(ys[-1] + 1 - (half_h + lim_y) * px_per_m),
+    ] if len(xs) and len(ys) else [float("inf")]
+    worst = max(errs)
+    check("render: felt edge within 1 px of the physical rail (multiball)", worst <= 1.0,
+          f"worst edge error {worst:.2f} px (left/right/top/bottom {', '.join(f'{e:.2f}' for e in errs)})")
 
 
 # --- 4. Pockets: a ball rolled into each of the 6 is potted once and removed ------------
@@ -395,6 +426,7 @@ if __name__ == "__main__":
     test_regression()
     test_head_on()
     test_cushion_angle()
+    test_render_felt_edge()
     test_pockets_all_six()
     test_pocket_once_only()
     test_scratch()
