@@ -62,6 +62,8 @@ SETUP_MAX_TRIES = 1000
 RENDER_WIDTH = 432
 RENDER_HEIGHT = 240
 RENDER_MARGIN = 0.03  # m beyond the table on each side (x); y margin is set by the aspect ratio
+FELT_COLOR = "#1a6c2a"   # multiball felt (same green as the legacy inner table)
+RAIL_COLOR = "#5c3a1a"   # multiball rail band (same brown as the legacy cushion outline)
 
 # Simulation
 DT = 1 / 60.0
@@ -655,31 +657,10 @@ class SimEnv(BaseEnv):
         ax.axis("off")
         fig.patch.set_facecolor("#1a5c2a")
 
-        # Cushions
-        cushion = patches.Rectangle(
-            (-TABLE_LENGTH / 2 - CUSHION_THICKNESS, -TABLE_WIDTH / 2 - CUSHION_THICKNESS),
-            TABLE_LENGTH + 2 * CUSHION_THICKNESS,
-            TABLE_WIDTH + 2 * CUSHION_THICKNESS,
-            linewidth=2,
-            edgecolor="#5c3a1a",
-            facecolor="none",
-        )
-        ax.add_patch(cushion)
-
-        inner = patches.Rectangle(
-            (-TABLE_LENGTH / 2, -TABLE_WIDTH / 2),
-            TABLE_LENGTH,
-            TABLE_WIDTH,
-            linewidth=1,
-            edgecolor="#2a7a3a",
-            facecolor="#1a6c2a",
-        )
-        ax.add_patch(inner)
-
-        # Pockets (multiball mode only): static dark circles, identical every frame.
         if not self._legacy:
-            for px, py in pocket_centers():
-                ax.add_patch(plt.Circle((px, py), self._pocket_radius, color="#0a0a0a", zorder=1))
+            self._draw_multiball_table(ax)
+        else:
+            self._draw_legacy_table(ax)
 
         # Balls, drawn in id order (cue first). The cue ball is rendered exactly as before.
         for ball_id in sorted(self._ball_bodies):
@@ -729,6 +710,45 @@ class SimEnv(BaseEnv):
         plt.close(fig)
         assert img.shape == (RENDER_HEIGHT, RENDER_WIDTH, 3), img.shape
         return img
+
+    def _draw_multiball_table(self, ax):
+        """Multiball table drawn at the physical geometry: the felt ends exactly where a ball
+        surface meets the rail (+-hl - cushion radius), so a ball at rest against a cushion is
+        drawn touching it. Rail is a filled band out to the old outer outline; pockets on top."""
+        hl, hw = TABLE_LENGTH / 2, TABLE_WIDTH / 2
+        t = self._cushion_radius
+        ax.add_patch(patches.Rectangle(
+            (-hl - CUSHION_THICKNESS, -hw - CUSHION_THICKNESS),
+            TABLE_LENGTH + 2 * CUSHION_THICKNESS, TABLE_WIDTH + 2 * CUSHION_THICKNESS,
+            linewidth=0, facecolor=RAIL_COLOR, zorder=0))
+        ax.add_patch(patches.Rectangle(
+            (-hl + t, -hw + t), TABLE_LENGTH - 2 * t, TABLE_WIDTH - 2 * t,
+            linewidth=0, facecolor=FELT_COLOR, zorder=0))
+        for px, py in pocket_centers():
+            ax.add_patch(plt.Circle((px, py), self._pocket_radius, color="#0a0a0a", zorder=1))
+
+    def _draw_legacy_table(self, ax):
+        """Legacy table drawing, unchanged (render hashes in tests/baseline_legacy.json)."""
+        # Cushions
+        cushion = patches.Rectangle(
+            (-TABLE_LENGTH / 2 - CUSHION_THICKNESS, -TABLE_WIDTH / 2 - CUSHION_THICKNESS),
+            TABLE_LENGTH + 2 * CUSHION_THICKNESS,
+            TABLE_WIDTH + 2 * CUSHION_THICKNESS,
+            linewidth=2,
+            edgecolor="#5c3a1a",
+            facecolor="none",
+        )
+        ax.add_patch(cushion)
+
+        inner = patches.Rectangle(
+            (-TABLE_LENGTH / 2, -TABLE_WIDTH / 2),
+            TABLE_LENGTH,
+            TABLE_WIDTH,
+            linewidth=1,
+            edgecolor="#2a7a3a",
+            facecolor="#1a6c2a",
+        )
+        ax.add_patch(inner)
 
 
 if __name__ == "__main__":
