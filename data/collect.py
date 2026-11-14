@@ -47,6 +47,8 @@ MODES = {
     ),
     "shot_pairs": dict(episodes=5000, prefix="shots"),
 }
+# Multiball modes live in data/collect_mb.py (default file prefix per mode).
+MB_MODES = {"mb_shots": "mbshots", "mb_frames": "mbframes"}
 FIRE_FORCE_RANGE = (0.3, 1.0)
 SHOT_FORCE_RANGE = (0.05, 1.0)  # include soft shots: short targets need them
 SHOT_MAX_SETTLE_STEPS = 900     # 15 s; shots settle in <2 s with rolling resistance
@@ -270,7 +272,7 @@ def collect_shots(episodes=None, prefix=None, force_range=SHOT_FORCE_RANGE, forc
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=list(MODES), default="random_drive")
+    parser.add_argument("--mode", choices=list(MODES) + list(MB_MODES), default="random_drive")
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--prefix", default=None, help="Override the output file prefix")
     parser.add_argument("--force-range", type=float, nargs=2, default=SHOT_FORCE_RANGE,
@@ -283,8 +285,25 @@ if __name__ == "__main__":
                         help="shot_pairs: keep only shots where the cue ball rolls out straight "
                              "(no cushion or ball contact)")
     parser.add_argument("--seed", type=int, default=None,
-                        help="seed the scene/force RNG (use different seeds for different runs)")
+                        help="seed the scene/force RNG (use different seeds for different runs); "
+                             "for mb_* modes this is the shard index unless --shard is given")
+    parser.add_argument("--split", choices=["train", "test", "novel"], default="train",
+                        help="mb_* modes: scene-seed range and default ball counts (see collect_mb.py)")
+    parser.add_argument("--shard", type=int, default=None, help="mb_* modes: shard index")
+    parser.add_argument("--n-balls", type=int, nargs=2, default=None, metavar=("LO", "HI"),
+                        help="mb_* modes: override the split's object-ball count range")
     args = parser.parse_args()
+    if args.mode in MB_MODES:
+        from data.collect_mb import collect_mb_shots, collect_mb_frames
+        shard = args.shard if args.shard is not None else (args.seed or 0)
+        prefix = args.prefix or f"{MB_MODES[args.mode]}_{args.split}_s{shard}"
+        if args.mode == "mb_shots":
+            collect_mb_shots(DATASETS_DIR, prefix, args.episodes or 1000, args.split, shard,
+                             args.n_balls)
+        else:
+            collect_mb_frames(DATASETS_DIR, prefix, args.episodes or 100, args.split, shard,
+                              args.n_balls)
+        sys.exit(0)
     if args.seed is not None:
         random.seed(args.seed)
     if args.mode == "shot_pairs":

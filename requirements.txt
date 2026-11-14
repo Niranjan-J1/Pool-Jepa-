@@ -5,3 +5,4 @@ matplotlib>=3.7
 pillow>=10.0
 imageio>=2.30
 imageio-ffmpeg>=0.4
+typing_extensions>=4.0; python_version < "3.11"
