@@ -216,6 +216,7 @@ class SimEnv(BaseEnv):
         self._ball_shapes: dict[int, pymunk.Shape] = {}
         self._ball_colors: dict[int, tuple] = {}
         self._potted: list[int] = []
+        self._pot_events: list[tuple[int, int]] = []   # (ball_id, pocket index), cue included
         self._scratch = False
         self._fig = None
         self._ax = None
@@ -311,6 +312,7 @@ class SimEnv(BaseEnv):
         self._ball_shapes.clear()
         self._ball_colors.clear()
         self._potted = []
+        self._pot_events = []
         self._scratch = False
 
         self._add_walls(self._space)
@@ -525,15 +527,16 @@ class SimEnv(BaseEnv):
             x, y = pos.x, pos.y
             if -nx < x < nx and -ny < y < ny:
                 continue  # interior: too far from every pocket
-            for px, py in pockets:
+            for k, (px, py) in enumerate(pockets):
                 dx, dy = x - px, y - py
                 if dx * dx + dy * dy <= r2:
                     if potted_now is None:
                         potted_now = []
-                    potted_now.append(ball_id)
+                    potted_now.append((ball_id, k))
                     break
         if potted_now:
-            for ball_id in potted_now:
+            self._pot_events.extend(potted_now)
+            for ball_id, _ in potted_now:
                 if ball_id == CUE_ID:
                     self._scratch = True
                     self._respawn_cue()
@@ -638,6 +641,9 @@ class SimEnv(BaseEnv):
                 for i, b in sorted(self._ball_bodies.items())
             }
             obs["potted"] = list(self._potted)
+            # (ball_id, pocket index into pocket_centers()) per pot since reset, in order. The
+            # cue (id 0) appears here on a scratch; `potted` stays object balls only.
+            obs["potted_pockets"] = list(self._pot_events)
             obs["scratch"] = self._scratch
             obs["n_balls_on_table"] = len(self._ball_bodies)
         return obs

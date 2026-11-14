@@ -149,16 +149,19 @@ def test_pockets_all_six():
         norm = math.hypot(*d) or 1.0
         env._ball_bodies[1].velocity = (0.8 * d[0]/norm, 0.8 * d[1]/norm)
         potted_seen = 0
+        events = None
         for _ in range(400):
             obs = env.step(IDLE, render=False)
             if 1 in obs["potted"]:
                 potted_seen = obs["potted"].count(1)
+                events = obs["potted_pockets"]
                 break
         removed = 1 not in env._ball_bodies
-        ok = potted_seen == 1 and removed
+        ok = potted_seen == 1 and removed and events == [(1, pi)]
         all_ok &= ok
         detail.append(f"p{pi}:{'ok' if ok else 'FAIL'}")
-    check("all 6 pockets register a pot exactly once and remove the ball", all_ok, " ".join(detail))
+    check("all 6 pockets register a pot exactly once, in the right pocket, and remove the ball",
+          all_ok, " ".join(detail))
 
 
 def test_pocket_once_only():
