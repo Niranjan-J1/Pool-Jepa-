@@ -2,6 +2,7 @@
 # Sharded data collection. One shard per job, so each job fits the 2 h limit.
 # Usage:  sbatch scripts/slurm/collect.sbatch <mode> <shard> [episodes] [extra collect.py args...]
 #   e.g.  sbatch scripts/slurm/collect.sbatch strike_outcomes 0 500
+#         sbatch scripts/slurm/collect.sbatch mb_shots 3 5000 --split train
 # Shard k uses --seed k and --prefix <mode>_s<k>, so shards never overwrite each other.
 #SBATCH --job-name=pj-collect
 #SBATCH --cpus-per-task=4
@@ -20,5 +21,10 @@ cd "${SLURM_SUBMIT_DIR}"
 mkdir -p logs
 
 echo "commit $(git rev-parse --short HEAD)  mode=$MODE shard=$SHARD data=$POOLJEPA_DATA"
-python data/collect.py --mode "$MODE" --seed "$SHARD" --prefix "${MODE}_s${SHARD}" \
-    ${EPISODES:+--episodes "$EPISODES"} "$@"
+if [[ "$MODE" == mb_* ]]; then
+    # Multiball: collect.py names files <mode>_<split>_s<shard>; pass --split in the extra args.
+    python data/collect.py --mode "$MODE" --shard "$SHARD" ${EPISODES:+--episodes "$EPISODES"} "$@"
+else
+    python data/collect.py --mode "$MODE" --seed "$SHARD" --prefix "${MODE}_s${SHARD}" \
+        ${EPISODES:+--episodes "$EPISODES"} "$@"
+fi
