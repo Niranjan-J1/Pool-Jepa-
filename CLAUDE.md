@@ -12,7 +12,7 @@ Pool-JEPA: a small robot plays pool on a 26" tabletop table using a self-supervi
 - project_proposal.md : the full plan. README.md : results so far.
 
 # Commands
-- Regression (must print IDENTICAL): python tests/regression_baseline.py
+- Regression: python tests/regression_baseline.py (must print IDENTICAL on the laptop; on the cluster "OK: within 1e-9" is acceptable, from last-bit float rounding)
 - Sim tests: python tests/test_multiball.py
 - Encoder training: experiments/train_encoder.py; shot model: experiments/train_shot_model.py
 

@@ -46,7 +46,10 @@ def test_regression():
         import json
         baseline = json.load(f)
     worst = rb.compare(rb.compute(), baseline)
-    check("regression: legacy SimEnv() reproduces baseline", worst == 0.0, f"max abs diff {worst:.1e}")
+    # Same bar as regression_baseline.py: exact on the laptop that made the baseline; other
+    # machines (cluster CPU/numpy) differ by ~1e-16 from last-bit rounding, which is not a change.
+    check("regression: legacy SimEnv() reproduces baseline (within 1e-9)", worst < 1e-9,
+          f"max abs diff {worst:.1e}" + (" (identical)" if worst == 0.0 else ""))
 
 
 # --- 2. Head-on collision (equal mass): cue stops, object carries on ---------------------
