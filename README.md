@@ -2,8 +2,9 @@
 
 **A small robot that learns to play pool by imagining its shots before it takes them.**
 
-A differential-drive robot with a solenoid striker sees the table only through an overhead camera.
-A self-supervised encoder (JEPA-style, with no labels and no pixel reconstruction) turns the camera
+A differential-drive robot with a solenoid striker finds the cue ball through an overhead camera.
+(In the current sim results the robot's own pose comes from the simulator, not the camera; a
+marker-based pose is planned.) A self-supervised encoder (JEPA-style, with no labels and no pixel reconstruction) turns the camera
 frames into a compact latent state. A learned shot model then predicts where each possible strike
 would leave the cue ball. The robot drives into position, imagines every strike strength, picks
 the one predicted to land closest to the target, and fires.
@@ -104,6 +105,7 @@ where the whole loop succeeds cleanly.
 ## Known limitations
 
 - Simulation only so far; nothing has been run on hardware yet.
+- Stage 1 uses the simulator's true robot pose; only the cue-ball position is read from pixels.
 - Aim accuracy is capped by the cue-ball readout (about 1.25 cm), which matters most on short
   shots.
 - Stage 1 times out in about 8% of trials when it uses the decoded cue position.
