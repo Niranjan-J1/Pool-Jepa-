@@ -32,10 +32,20 @@ class SpatialSoftmax(nn.Module):
     are mostly zero, so raw feature maps vary by ~1e-3 and the softmax would be flat
     (every keypoint stuck at the centre). Standardized, an object is a z-score peak (~6
     at init), and keypoints track frame content from the first step.
+
+    With presence=True each keypoint also reports p in (0, 1): a squashed peak z-score of
+    its map. (x, y) alone can't say "this object is gone" (a potted ball), because the
+    softmax always lands somewhere; p is high when the map has a clear peak and low when
+    it is only noise. Layout then is [x_0, y_0, p_0, x_1, y_1, p_1, ...].
     """
 
-    def __init__(self, init_temperature: float = 0.5):
+    # Peak z-score -> p: a lone noise map peaks around z~3-4, a small object far higher.
+    PRESENCE_CENTER = 6.0
+    PRESENCE_SCALE = 2.0
+
+    def __init__(self, init_temperature: float = 0.5, presence: bool = False):
         super().__init__()
+        self.presence = presence
         self.log_temperature = nn.Parameter(torch.tensor(float(init_temperature)).log())
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
@@ -47,7 +57,10 @@ class SpatialSoftmax(nn.Module):
         xs = torch.linspace(-1.0, 1.0, ww, device=h.device, dtype=h.dtype)
         x = (attn.sum(2) * xs).sum(-1)  # marginal over rows -> expected column
         y = (attn.sum(3) * ys).sum(-1)  # marginal over columns -> expected row
-        return torch.stack([x, y], dim=-1).flatten(1)
+        if not self.presence:
+            return torch.stack([x, y], dim=-1).flatten(1)
+        p = torch.sigmoid((flat.amax(-1) - self.PRESENCE_CENTER) / self.PRESENCE_SCALE)
+        return torch.stack([x, y, p], dim=-1).flatten(1)
 
 
 class VisualEncoder(nn.Module):
@@ -61,13 +74,19 @@ class VisualEncoder(nn.Module):
     head="spatial_softmax": three stride-2 convs + one stride-1 conv (stride 8 overall,
         e.g. 240x432 -> 30x54), a 1x1 conv to latent_dim // 2 keypoint channels, then
         SpatialSoftmax. The latent is the (x, y) of each keypoint, bounded to [-1, 1].
+        presence=True (spatial_softmax only) appends a presence value per keypoint, so the
+        output has out_dim = 3 * latent_dim // 2 entries instead of latent_dim. It adds no
+        parameters, so older checkpoints still load.
     """
 
     def __init__(self, latent_dim: int = 64, num_simplices: int = 8, in_channels: int = 3,
                  use_simnorm: bool = True, input_hw: tuple[int, int] = (128, 128),
-                 head: str = "linear"):
+                 head: str = "linear", presence: bool = False):
         super().__init__()
+        if presence and head != "spatial_softmax":
+            raise ValueError("presence needs head='spatial_softmax'")
         self.latent_dim = latent_dim
+        self.out_dim = 3 * latent_dim // 2 if presence else latent_dim
         self.in_channels = in_channels
         self.head = head
 
@@ -102,7 +121,7 @@ class VisualEncoder(nn.Module):
                 nn.ReLU(),
                 nn.Conv2d(128, self.num_keypoints, 1),
             )
-            self.spatial_softmax = SpatialSoftmax()
+            self.spatial_softmax = SpatialSoftmax(presence=presence)
         else:
             raise ValueError(f"Unknown head: {head}")
 
