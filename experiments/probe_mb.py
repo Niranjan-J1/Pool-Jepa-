@@ -164,11 +164,47 @@ def main():
     ap.add_argument("--mlp-steps", type=int, default=MLP_STEPS, help="lower for CPU smoke tests")
     args = ap.parse_args()
     MLP_STEPS = args.mlp_steps
-    rng = np.random.default_rng(SEED)
     enc, cfg = load_encoder(args.run_dir, args.encoder)
+    torch.manual_seed(SEED)
+    untrained = VisualEncoder(latent_dim=cfg["latent_dim"], in_channels=cfg["in_channels"], use_simnorm=False,
+                              input_hw=tuple(cfg["frame_hw"]), head="spatial_softmax",
+                              presence=cfg["presence"]).to(DEVICE).eval()
     bg = torch.from_numpy(load_background()).to(DEVICE)
     print(f"encoder {args.run_dir} ({args.encoder}), latent {cfg['out_dim']}, data {DATA_DIR}", flush=True)
 
+    # The untrained encoder (same architecture, random weights) is the baseline: background
+    # subtraction + spatial softmax already localize objects, so "trained" must clearly beat it
+    # before we credit self-supervised learning. Both see exactly the same rows (same seed).
+    print(f"\n{'encoder':<10} {'set':<12} {'probe':<6} {'n':>6} {'ball med cm':>12} {'p90 cm':>8} "
+          f"{'mask acc %':>11} {'pose cm':>8} {'pose deg':>9}")
+    results = {}
+    for label, e in (("trained", enc), ("untrained", untrained)):
+        for key, r in probe_encoder(e, cfg, bg).items():
+            results[(label,) + key] = r
+            name, pname = key
+            pose = f"{r['pose_cm']:8.2f} {r['pose_deg']:9.1f}" if "pose_cm" in r else f"{'-':>8} {'-':>9}"
+            print(f"{label:<10} {name:<12} {pname:<6} {r['n']:>6} {r['med']:>12.2f} {r['p90']:>8.2f} "
+                  f"{r['mask_acc']:>11.2f} {pose}", flush=True)
+
+    print("\nTrained vs untrained (mlp probe, ball median cm / mask acc %):")
+    for (label, name, pname), r in results.items():
+        if label == "trained" and pname == "mlp":
+            u = results[("untrained", name, pname)]
+            print(f"  {name:<12} {r['med']:.2f} vs {u['med']:.2f} cm   {r['mask_acc']:.2f} vs {u['mask_acc']:.2f} %")
+
+    gate = [r for (label, name, pname), r in results.items()
+            if label == "trained" and pname == "mlp" and name.split("/")[0] in ("test", "novel")]
+    ok_pos = all(r["med"] <= 1.5 and r["p90"] <= 3.0 for r in gate)
+    ok_mask = all(r["mask_acc"] >= 99.0 for r in gate)
+    print(f"\nB2 DONE-CRITERIA (trained, mlp, test+novel, pre+post): ball median<=1.5 & p90<=3 cm: "
+          f"{'PASS' if ok_pos else 'FAIL'};  mask acc>=99%: {'PASS' if ok_mask else 'FAIL'}")
+    print("Note: probes are supervised readouts trained on sim labels; the encoder is self-supervised.")
+
+
+def probe_encoder(enc, cfg, bg):
+    """Fit ridge + mlp probes on this encoder's features and evaluate them on every set.
+    Returns {(set name, probe name): metrics}."""
+    rng = np.random.default_rng(SEED)
     files = [f for f in list_files(FRAMES_PATTERN) if os.path.basename(f) != cfg["holdout_file"]]
     pick = np.linspace(0, len(files) - 1, min(PROBE_FILES, len(files))).astype(int)
     zs, ys = [], []
@@ -189,24 +225,7 @@ def main():
     for split in ("test", "novel"):
         for view, zy in shots_sets(enc, f"mbshots_{split}_*.npz", EVAL_SHOTS, bg, rng).items():
             evals[f"{split}/{view}"] = zy
-
-    print(f"\n{'set':<12} {'probe':<6} {'n':>6} {'ball med cm':>12} {'p90 cm':>8} {'mask acc %':>11} "
-          f"{'pose cm':>8} {'pose deg':>9}")
-    results = {}
-    for name, (z, y) in evals.items():
-        for pname, pr in probes.items():
-            r = metrics(pr, z, y)
-            results[(name, pname)] = r
-            pose = f"{r['pose_cm']:8.2f} {r['pose_deg']:9.1f}" if "pose_cm" in r else f"{'-':>8} {'-':>9}"
-            print(f"{name:<12} {pname:<6} {r['n']:>6} {r['med']:>12.2f} {r['p90']:>8.2f} {r['mask_acc']:>11.2f} {pose}")
-
-    gate = [r for (name, pname), r in results.items()
-            if pname == "mlp" and name.split("/")[0] in ("test", "novel")]
-    ok_pos = all(r["med"] <= 1.5 and r["p90"] <= 3.0 for r in gate)
-    ok_mask = all(r["mask_acc"] >= 99.0 for r in gate)
-    print(f"\nB2 DONE-CRITERIA (mlp, test+novel, pre+post): ball median<=1.5 & p90<=3 cm: "
-          f"{'PASS' if ok_pos else 'FAIL'};  mask acc>=99%: {'PASS' if ok_mask else 'FAIL'}")
-    print("Note: probes are supervised readouts trained on sim labels; the encoder is self-supervised.")
+    return {(name, pname): metrics(pr, z, y) for name, (z, y) in evals.items() for pname, pr in probes.items()}
 
 
 if __name__ == "__main__":
