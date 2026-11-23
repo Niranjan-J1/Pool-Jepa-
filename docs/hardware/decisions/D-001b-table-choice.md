@@ -1,6 +1,6 @@
 # D-001b: Table choice
 
-**Status:** APPROVED 2026-11-23: **Soozier 38" folding tabletop** is the primary development table (buy now).
+**Status:** APPROVED 2026-11-23: **Soozier 38" folding tabletop** is the primary development table. **Purchase deferred (2026-11-23): it's bought later, not now.** Until it's measured, its playfield and balls remain estimates (86×43 / 81×38 cm; balls 1–1.5").
 **Also decided:** a friend's full-size table (7–9 ft) is a **later stretch transfer test**, not the primary platform. Numbers from the discussion:
 - Robot B reaches 83–88% of shots with 5 balls on a full-size table.
 - Full-size balls (about 170 g) need about 0.34 J at 2 m/s, about 7× the mini solenoid. That means a separate scaled-up striker or robot, built after the small-table system works.
