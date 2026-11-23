@@ -1,6 +1,6 @@
 # D-001a: Robot packing study (smallest realistic footprint)
 
-**Status:** PROPOSED. Waiting for your approval.
+**Status:** APPROVED 2026-11-23. All three items below accepted as written: variant B envelope, R-REACH = sim parity, table guidance.
 **Date:** 2026-11-23
 **Why:** you chose to design the robot first and then pick a table to fit it. This study takes the parts the robot needs, lays them out in two decks, and gets the smallest footprint that actually holds them. The exact part choices come later, in D-003 to D-007; here only their sizes matter.
 
