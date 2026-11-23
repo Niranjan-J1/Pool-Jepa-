@@ -22,7 +22,7 @@ CAD: Onshape.
 |---|---|---|
 | [D-001](decisions/D-001-system-scale.md) | System scale: robot footprint, table, balls | SPLIT into D-001a/b |
 | [D-001a](decisions/D-001a-robot-packing.md) | Robot packing study (footprint) | APPROVED |
-| [D-001b](decisions/D-001b-table-choice.md) | Table choice (from D-001a footprint) | PROPOSED |
+| [D-001b](decisions/D-001b-table-choice.md) | Table choice: Soozier 38" primary; friend's full-size table = later stretch | APPROVED |
 | D-002 | Camera | not started |
 | D-003 | Striker (solenoid, driver, strike height) | not started |
 | D-004 | Drive (motors, encoders, wheels) | not started |
