@@ -21,7 +21,9 @@ N = 200_000
 SETUP_D = float(np.mean(SETUP_DISTANCE_RANGE))  # front edge -> ball centre (m)
 
 
-def reachable_fraction(robot_l, robot_w, table_l, table_w, ball_r, d=SETUP_D, n=N, seed=0):
+def reachable_fraction(robot_l, robot_w, table_l, table_w, ball_r, d=SETUP_D, n=N, seed=0, n_other=0):
+    """n_other: other object balls placed uniformly on the playfield (one redraw if they
+    overlap the cue ball). The robot rectangle must not overlap any of them either."""
     rng = np.random.default_rng(seed)
     hl, hw = table_l / 2, table_w / 2
     # Ball centres anywhere a ball can rest (inside the rails).
@@ -37,6 +39,18 @@ def reachable_fraction(robot_l, robot_w, table_l, table_w, ball_r, d=SETUP_D, n=
             x = cx + lx * c - ly * s
             y = cy + lx * s + ly * c
             ok &= (np.abs(x) <= hl) & (np.abs(y) <= hw)
+    for _ in range(n_other):
+        ox = rng.uniform(-hl + ball_r, hl - ball_r, n)
+        oy = rng.uniform(-hw + ball_r, hw - ball_r, n)
+        clash = np.hypot(ox - bx, oy - by) < 2 * ball_r
+        ox[clash] = rng.uniform(-hl + ball_r, hl - ball_r, clash.sum())
+        oy[clash] = rng.uniform(-hw + ball_r, hw - ball_r, clash.sum())
+        # Other ball in the robot frame; closest point of the rectangle to its centre.
+        dx, dy = ox - cx, oy - cy
+        rx, ry = dx * c + dy * s, -dx * s + dy * c
+        qx = np.clip(rx, -robot_l / 2, robot_l / 2)
+        qy = np.clip(ry, -robot_w / 2, robot_w / 2)
+        ok &= np.hypot(rx - qx, ry - qy) > ball_r
     return float(ok.mean())
 
 
@@ -53,13 +67,16 @@ def main():
         "smaller 56x28 cm (if 26 in = frame), 2.54 cm balls": (0.56, 0.28, 0.0127),
         "DIY 120x60 cm, 2.54 cm balls": (1.20, 0.60, 0.0127),
     }
-    print(f"setup distance (front edge -> ball centre) {SETUP_D * 100:.1f} cm; {N:,} random (ball, heading) pairs\n")
-    print(f"{'table':<52} {'robot':<20} {'reachable':>9} {'covers':>7}")
+    print(f"setup distance (front edge -> ball centre) {SETUP_D * 100:.1f} cm; {N:,} random (ball, heading) pairs")
+    print("reachable = robot fits behind the cue ball; 'rails' ignores other balls, '+5 balls' also "
+          "avoids 5 other object balls (typical mid-game)\n")
+    print(f"{'table':<52} {'robot':<20} {'rails':>7} {'+5 balls':>9} {'covers':>7}")
     for tname, (tl, tw, br) in tables.items():
         for rname, (rl, rw) in robots.items():
-            f = reachable_fraction(rl, rw, tl, tw, br)
+            f0 = reachable_fraction(rl, rw, tl, tw, br)
+            f5 = reachable_fraction(rl, rw, tl, tw, br, n_other=5)
             cover = rl * rw / (tl * tw)
-            print(f"{tname:<52} {rname:<20} {100 * f:>8.1f}% {100 * cover:>6.1f}%")
+            print(f"{tname:<52} {rname:<20} {100 * f0:>6.1f}% {100 * f5:>8.1f}% {100 * cover:>6.1f}%")
         print()
     print("ball/table ratio (ball diameter / playfield length):")
     for tname, (tl, tw, br) in tables.items():

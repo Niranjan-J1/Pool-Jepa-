@@ -1,6 +1,6 @@
 # D-001: System scale (robot footprint, table, balls)
 
-**Status:** PROPOSED. Waiting for your approval.
+**Status:** SPLIT (2026-11-23). By your choice, the robot is designed first: see [D-001a](D-001a-robot-packing.md). This file's analysis and measurement checklist carry over into D-001b (table choice). R-REACH changed to "sim parity", see D-001a.
 **Date:** 2026-11-23
 **Why decide this first:** the robot's size, the table's size and the ball size set the sim constants, the camera's field of view, how big the marker has to be, how strong the striker has to be, and which shots the robot can physically take. Every later decision (D-002 to D-007) depends on this one.
 
